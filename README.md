@@ -1,2 +1,2 @@
 # recurse-sdg-flow
-Recursive synthetic data generation pipeline
+Recursive synthetic data generation pipeline - placeholder
