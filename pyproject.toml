@@ -11,6 +11,19 @@ dependencies = [
     "scikit-learn==1.7.2",
     "openpyxl>=3.1.0",
     "pyyaml>=6.0",
+    # Step 3 — TRTR baseline (LightGBM + Optuna), also pinned exact
+    "prefect==3.6.24",
+    "lightgbm==4.5.0",
+    "optuna==4.6.0",
+    "betacal==1.1.0",
+    "plotly==5.24.1",
+    "kaleido==0.2.1",
+    # Prefect's transitive web-server stack — pinned exact too, since a newer
+    # fastapi/starlette combo breaks Prefect's embedded ephemeral server
+    # (AttributeError: 'PrefectRouter' object has no attribute 'routes')
+    "fastapi==0.135.2",
+    "starlette==1.0.0",
+    "pydantic==2.12.5",
 ]
 
 [build-system]
