@@ -15,6 +15,8 @@ one metric at a time (the port is being built incrementally); each
   tv_complement      -> TVComplementMetric       (sdmetrics.single_column.TVComplement)
   boundary_adherence -> BoundaryAdherenceMetric  (sdmetrics.single_column.BoundaryAdherence)
   category_adherence -> CategoryAdherenceMetric  (sdmetrics.single_column.CategoryAdherence)
+  table_structure    -> TableStructureMetric     (sdmetrics.single_table.TableStructure + pandas-dtype table)
+  semantic_structure -> SemanticStructureMetric  (pure-python metadata sdtype compare)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -41,6 +43,7 @@ from sdmetrics.single_column import (
     KSComplement,
     TVComplement,
 )
+from sdmetrics.single_table import TableStructure
 
 
 def ensure_json_serializable(obj: Any) -> Any:
@@ -609,6 +612,302 @@ class CategoryAdherenceMetric:
         return compatible_columns
 
 
+class TableStructureMetric:
+    """TableStructure metric implementation for table structure validation"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+
+    def _build_column_comparison(self, original: pd.DataFrame, synthetic: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Build detailed column comparison between original and synthetic data.
+
+        Following SDV's TableStructure logic:
+        - Numerator: columns with same name AND same pandas dtype
+        - Denominator: all combinations of (column name, dtype) across both datasets
+
+        Args:
+            original: Original DataFrame
+            synthetic: Synthetic DataFrame
+
+        Returns:
+            Dict with comparison details including counts and per-column status
+        """
+        # Get column information
+        real_cols = set(original.columns)
+        synth_cols = set(synthetic.columns)
+
+        # Initialize counters
+        n_matching = 0
+        n_dtype_mismatch = 0
+        n_missing = 0
+        n_extra = 0
+
+        # Build detailed comparison
+        column_details = {}
+        comparison_table = []
+
+        # Columns in both datasets
+        common_cols = real_cols & synth_cols
+        for col in sorted(common_cols):
+            real_dtype = str(original[col].dtype)
+            synth_dtype = str(synthetic[col].dtype)
+
+            if real_dtype == synth_dtype:
+                status = "match"
+                n_matching += 1
+            else:
+                status = "dtype_mismatch"
+                n_dtype_mismatch += 1
+
+            column_details[col] = {
+                "real_dtype": real_dtype,
+                "synthetic_dtype": synth_dtype,
+                "status": status
+            }
+            comparison_table.append({
+                "column": col,
+                "real_dtype": real_dtype,
+                "synthetic_dtype": synth_dtype,
+                "status": status
+            })
+
+        # Columns only in real data (missing in synthetic)
+        missing_cols = real_cols - synth_cols
+        for col in sorted(missing_cols):
+            real_dtype = str(original[col].dtype)
+            n_missing += 1
+
+            column_details[col] = {
+                "real_dtype": real_dtype,
+                "synthetic_dtype": None,
+                "status": "missing_in_synthetic"
+            }
+            comparison_table.append({
+                "column": col,
+                "real_dtype": real_dtype,
+                "synthetic_dtype": None,
+                "status": "missing_in_synthetic"
+            })
+
+        # Columns only in synthetic data (extra/unexpected)
+        extra_cols = synth_cols - real_cols
+        for col in sorted(extra_cols):
+            synth_dtype = str(synthetic[col].dtype)
+            n_extra += 1
+
+            column_details[col] = {
+                "real_dtype": None,
+                "synthetic_dtype": synth_dtype,
+                "status": "only_in_synthetic"
+            }
+            comparison_table.append({
+                "column": col,
+                "real_dtype": None,
+                "synthetic_dtype": synth_dtype,
+                "status": "only_in_synthetic"
+            })
+
+        return {
+            "summary": {
+                "total_real_columns": len(real_cols),
+                "total_synthetic_columns": len(synth_cols),
+                "matching_columns": n_matching,
+                "dtype_mismatches": n_dtype_mismatch,
+                "missing_in_synthetic": n_missing,
+                "only_in_synthetic": n_extra
+            },
+            "column_details": column_details,
+            "comparison_table": comparison_table
+        }
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate TableStructure metric"""
+        start_time = time.time()
+
+        try:
+            # Run evaluation using SDMetrics
+            score = TableStructure.compute(
+                real_data=original,
+                synthetic_data=synthetic
+            )
+
+            # Build detailed column comparison
+            comparison_data = self._build_column_comparison(original, synthetic)
+
+            return {
+                "score": float(score),
+                "summary": comparison_data["summary"],
+                "column_details": comparison_data["column_details"],
+                "comparison_table": comparison_data["comparison_table"],
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "score": 0.0,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
+class SemanticStructureMetric:
+    """SemanticStructure metric implementation using SDV metadata sdtypes instead of pandas dtypes"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+
+    def _build_semantic_comparison(self, original: pd.DataFrame, synthetic: pd.DataFrame,
+                                   original_metadata: SingleTableMetadata,
+                                   synthetic_metadata: SingleTableMetadata) -> Dict[str, Any]:
+        """
+        Build detailed column comparison based on SDV semantic types (sdtypes).
+
+        Compares columns based on their semantic meaning (numerical, categorical, datetime, etc.)
+        rather than strict pandas dtypes (int64, float64, object, etc.).
+
+        Args:
+            original: Original DataFrame
+            synthetic: Synthetic DataFrame
+            original_metadata: SDV metadata for original data
+            synthetic_metadata: SDV metadata for synthetic data
+
+        Returns:
+            Dict with comparison details including counts and per-column status
+        """
+        # Get column information
+        real_cols = set(original.columns)
+        synth_cols = set(synthetic.columns)
+
+        # Initialize counters
+        n_matching = 0
+        n_sdtype_mismatch = 0
+        n_missing = 0
+        n_extra = 0
+
+        # Build detailed comparison
+        column_details = {}
+        comparison_table = []
+
+        # Columns in both datasets
+        common_cols = real_cols & synth_cols
+        for col in sorted(common_cols):
+            # Get sdtypes from metadata
+            real_sdtype = original_metadata.columns.get(col, {}).get('sdtype', 'unknown')
+            synth_sdtype = synthetic_metadata.columns.get(col, {}).get('sdtype', 'unknown')
+
+            if real_sdtype == synth_sdtype:
+                status = "match"
+                n_matching += 1
+            else:
+                status = "sdtype_mismatch"
+                n_sdtype_mismatch += 1
+
+            column_details[col] = {
+                "real_sdtype": real_sdtype,
+                "synthetic_sdtype": synth_sdtype,
+                "status": status
+            }
+            comparison_table.append({
+                "column": col,
+                "real_sdtype": real_sdtype,
+                "synthetic_sdtype": synth_sdtype,
+                "status": status
+            })
+
+        # Columns only in real data (missing in synthetic)
+        missing_cols = real_cols - synth_cols
+        for col in sorted(missing_cols):
+            real_sdtype = original_metadata.columns.get(col, {}).get('sdtype', 'unknown')
+            n_missing += 1
+
+            column_details[col] = {
+                "real_sdtype": real_sdtype,
+                "synthetic_sdtype": None,
+                "status": "missing_in_synthetic"
+            }
+            comparison_table.append({
+                "column": col,
+                "real_sdtype": real_sdtype,
+                "synthetic_sdtype": None,
+                "status": "missing_in_synthetic"
+            })
+
+        # Columns only in synthetic data (extra/unexpected)
+        extra_cols = synth_cols - real_cols
+        for col in sorted(extra_cols):
+            synth_sdtype = synthetic_metadata.columns.get(col, {}).get('sdtype', 'unknown')
+            n_extra += 1
+
+            column_details[col] = {
+                "real_sdtype": None,
+                "synthetic_sdtype": synth_sdtype,
+                "status": "only_in_synthetic"
+            }
+            comparison_table.append({
+                "column": col,
+                "real_sdtype": None,
+                "synthetic_sdtype": synth_sdtype,
+                "status": "only_in_synthetic"
+            })
+
+        # Calculate score following SDV's TableStructure logic:
+        # Score = matching_columns / total_unique_combinations
+        total_combinations = n_matching + n_sdtype_mismatch + n_missing + n_extra
+        score = n_matching / total_combinations if total_combinations > 0 else 0.0
+
+        return {
+            "score": score,
+            "summary": {
+                "total_real_columns": len(real_cols),
+                "total_synthetic_columns": len(synth_cols),
+                "matching_columns": n_matching,
+                "sdtype_mismatches": n_sdtype_mismatch,
+                "missing_in_synthetic": n_missing,
+                "only_in_synthetic": n_extra
+            },
+            "column_details": column_details,
+            "comparison_table": comparison_table
+        }
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate SemanticStructure metric using SDV metadata sdtypes"""
+        start_time = time.time()
+
+        try:
+            # Use declared metadata for both — data is loaded with metadata-driven
+            # types via load_csv_with_metadata, so the schema is the ground truth.
+            original_metadata = metadata
+            synthetic_metadata = metadata
+
+            # Build detailed semantic comparison
+            comparison_data = self._build_semantic_comparison(
+                original, synthetic,
+                original_metadata, synthetic_metadata
+            )
+
+            return {
+                "score": float(comparison_data["score"]),
+                "summary": comparison_data["summary"],
+                "column_details": comparison_data["column_details"],
+                "comparison_table": comparison_data["comparison_table"],
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "score": 0.0,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
 # ===========================================================================
 # Dispatch
 # ===========================================================================
@@ -745,6 +1044,10 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return BoundaryAdherenceMetric(**parameters)
         case "category_adherence":
             return CategoryAdherenceMetric(**parameters)
+        case "table_structure":
+            return TableStructureMetric(**parameters)
+        case "semantic_structure":
+            return SemanticStructureMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 
