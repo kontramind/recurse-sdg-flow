@@ -19,6 +19,8 @@ one metric at a time (the port is being built incrementally); each
   semantic_structure -> SemanticStructureMetric  (pure-python metadata sdtype compare)
   alpha_precision    -> AlphaPrecisionMetric     (synthcity.metrics.eval_statistical.AlphaPrecision)
   prdc_score         -> PRDCScoreMetric          (synthcity.metrics.eval_statistical.PRDCScore)
+  jensenshannon_syndat -> JensenShannonSyndatMetric  (syndat.metrics.jensen_shannon_distance)
+    -- the strictest JSD variant; the one the paper reports.
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -46,6 +48,7 @@ from sdmetrics.single_column import (
     TVComplement,
 )
 from sdmetrics.single_table import TableStructure
+from syndat.metrics import jensen_shannon_distance as syndat_jsd
 from synthcity.metrics.eval_statistical import AlphaPrecision, PRDCScore
 from synthcity.plugins.core.dataloader import GenericDataLoader
 
@@ -1062,6 +1065,43 @@ class PRDCScoreMetric:
             }
 
 
+class JensenShannonSyndatMetric:
+    """Jensen-Shannon Distance metric implementation (SYNDAT)"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        self.n_unique_threshold = parameters.get("n_unique_threshold", 10)
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate Jensen-Shannon Distance metric using SYNDAT"""
+        start_time = time.time()
+
+        try:
+            # SYNDAT works directly with DataFrames
+            # Returns per-column JSD scores
+            jsd_per_column = syndat_jsd(original, synthetic, n_unique_threshold=self.n_unique_threshold)
+
+            # Calculate aggregate distance (mean across columns), lower=better
+            raw_distance = float(np.mean(list(jsd_per_column.values())))
+
+            return {
+                "distance_score": raw_distance,
+                "n_unique_threshold": self.n_unique_threshold,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "distance_score": 1.0,
+                "n_unique_threshold": self.n_unique_threshold,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
 # ===========================================================================
 # Dispatch
 # ===========================================================================
@@ -1206,6 +1246,8 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return AlphaPrecisionMetric(**parameters)
         case "prdc_score":
             return PRDCScoreMetric(**parameters)
+        case "jensenshannon_syndat":
+            return JensenShannonSyndatMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 
