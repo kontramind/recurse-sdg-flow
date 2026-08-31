@@ -132,6 +132,33 @@ every experiment folder in the production data lake), so they're out of
 scope here. `--library` is kept as a real argument rather than hardcoded,
 so adding another backend later is a contained change, not a rewrite.
 
+Every setting above can also come from an optional `--config path/to/file.yaml`
+instead of (or alongside) CLI flags — a CLI flag always wins when both are
+given. This is a plain `yaml.safe_load`, not Hydra: no interpolation,
+templating, or config-group composition, just a flat mapping of the same
+option names (underscored: `training_file`, `model_type`, `post_process_method`,
+etc.), e.g.:
+
+```yaml
+training_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
+population_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_population.csv
+metadata_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_metadata.json
+encoding_config: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_encoding.yaml
+model_type: arf
+seed: 28657
+params: {}
+```
+
+```bash
+uv run python3 flows/sdg_flow.py --config my_run.yaml
+uv run python3 flows/sdg_flow.py --config my_run.yaml --seed 111   # CLI --seed wins over the file's
+```
+
+This exists for settings that don't have a sane CLI-flag shape — the
+upcoming evaluation stages (statistical/privacy/detection metrics) have
+deeply nested per-metric configuration that only really works as a config
+file, not a wall of flags.
+
 This writes, under `--output-dir`:
 
 ```

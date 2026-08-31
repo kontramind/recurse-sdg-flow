@@ -38,6 +38,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from prefect import flow, task
 
 from sdg_core.encoding import RDTDatasetEncoder, load_encoding_config
@@ -537,52 +538,141 @@ def sdg_pipeline(
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+#
+# Every setting can come from either a CLI flag or an optional --config YAML
+# file; a CLI flag always wins when both are given. This is a plain
+# yaml.safe_load — no OmegaConf, no interpolation/templating, no config-group
+# composition (that machinery is exactly what Step 1 dropped along with
+# Hydra). It exists because upcoming steps (recursive loop, evaluation
+# stages) need settings that are naturally nested dicts/lists — a 15-entry
+# statistical-metrics config, for instance — which don't have a sane CLI-flag
+# shape. Every flag below still works standalone with zero config file, as
+# already documented/verified in the README.
+
+VALID_MODEL_TYPES = {"arf", "ctgan", "ddpm", "rtvae", "nflow"}
+VALID_POST_PROCESS_METHODS = {"knn", "weighted", "random", "none"}
+VALID_FALLBACKS = {"knn", "weighted", "random"}
+
+# Hardcoded fallback defaults, used only when a setting is given by neither
+# the CLI nor --config.
+_DEFAULTS = {
+    "library": "synthcity",
+    "seed": 42,
+    "params": {},
+    "post_process_method": "knn",
+    "knn_neighbors": 5,
+    "distance_metric": "hamming",
+    "fallback": "weighted",
+    "force_generate": False,
+    "encoder_dir": "outputs/sdg_runs/encoders",
+    "output_dir": "outputs/sdg_runs",
+}
+
+
+def _load_config(config_path: Optional[str]) -> dict:
+    if not config_path:
+        return {}
+    with open(config_path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _resolve(cli_value, config: dict, key: str, default=None):
+    """CLI value wins if given; else config[key] if present; else default."""
+    if cli_value is not None:
+        return cli_value
+    return config.get(key, default)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the SDG pipeline (fit_encoder + encode_data + train_sdg)",
+        description="Run the SDG pipeline (fit_encoder + encode_data + train_sdg + generate_synthetic)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--training-file", required=True, help="Path to training CSV")
-    parser.add_argument("--population-file", required=True, help="Path to population CSV")
-    parser.add_argument("--metadata-file", required=True, help="Path to metadata JSON")
-    parser.add_argument("--encoding-config", required=True, help="Path to encoding YAML")
-    parser.add_argument("--model-type", required=True, choices=["arf", "ctgan", "ddpm", "rtvae", "nflow"], help="Synthcity generator to train")
-    parser.add_argument("--library", default="synthcity", help="Generator library (only 'synthcity' is implemented; kept as a real seam for future libraries)")
-    parser.add_argument("--seed", type=int, default=42, help="Model seed")
-    parser.add_argument("--params", default="{}", help="Inline JSON string of model hyperparameter overrides")
+    parser.add_argument("--config", default=None, help="Optional path to a plain YAML config file; CLI flags below override it")
+    parser.add_argument("--training-file", default=None, help="Path to training CSV")
+    parser.add_argument("--population-file", default=None, help="Path to population CSV")
+    parser.add_argument("--metadata-file", default=None, help="Path to metadata JSON")
+    parser.add_argument("--encoding-config", default=None, help="Path to encoding YAML")
+    parser.add_argument("--model-type", default=None, choices=sorted(VALID_MODEL_TYPES), help="Synthcity generator to train")
+    parser.add_argument("--library", default=None, help="Generator library (only 'synthcity' is implemented; kept as a real seam for future libraries)")
+    parser.add_argument("--seed", type=int, default=None, help="Model seed")
+    parser.add_argument("--params", default=None, help="Inline JSON string of model hyperparameter overrides")
     parser.add_argument("--reference-file", default=None, help="Reference CSV for auto-sizing --n-samples (default: same as --training-file, matching production configs)")
     parser.add_argument("--n-samples", type=int, default=None, help="Number of synthetic rows to generate (default: auto-size from --reference-file)")
-    parser.add_argument("--post-process-method", default="knn", choices=["knn", "weighted", "random", "none"], help="Invalid-category fixing method ('none' disables post-processing)")
-    parser.add_argument("--knn-neighbors", type=int, default=5, help="Neighbors for the 'knn' post-process method")
-    parser.add_argument("--distance-metric", default="hamming", help="Distance metric for the 'knn' post-process method")
-    parser.add_argument("--fallback", default="weighted", choices=["knn", "weighted", "random"], help="Fallback method when a column is 100% invalid")
-    parser.add_argument("--force-generate", action="store_true", help="Regenerate synthetic data even if cached output exists")
-    parser.add_argument("--encoder-dir", default="outputs/sdg_runs/encoders", help="Shared population-encoder cache dir")
-    parser.add_argument("--output-dir", default="outputs/sdg_runs", help="Per-run output directory")
+    parser.add_argument("--post-process-method", default=None, choices=sorted(VALID_POST_PROCESS_METHODS), help="Invalid-category fixing method ('none' disables post-processing)")
+    parser.add_argument("--knn-neighbors", type=int, default=None, help="Neighbors for the 'knn' post-process method")
+    parser.add_argument("--distance-metric", default=None, help="Distance metric for the 'knn' post-process method")
+    parser.add_argument("--fallback", default=None, choices=sorted(VALID_FALLBACKS), help="Fallback method when a column is 100% invalid")
+    parser.add_argument("--force-generate", action="store_true", default=None, help="Regenerate synthetic data even if cached output exists")
+    parser.add_argument("--encoder-dir", default=None, help="Shared population-encoder cache dir")
+    parser.add_argument("--output-dir", default=None, help="Per-run output directory")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    parameters = json.loads(args.params)
+    config = _load_config(args.config)
+
+    training_file = _resolve(args.training_file, config, "training_file")
+    population_file = _resolve(args.population_file, config, "population_file")
+    metadata_file = _resolve(args.metadata_file, config, "metadata_file")
+    encoding_config_file = _resolve(args.encoding_config, config, "encoding_config")
+    model_type = _resolve(args.model_type, config, "model_type")
+    library = _resolve(args.library, config, "library", _DEFAULTS["library"])
+    seed = _resolve(args.seed, config, "seed", _DEFAULTS["seed"])
+    reference_file = _resolve(args.reference_file, config, "reference_file")
+    n_samples = _resolve(args.n_samples, config, "n_samples")
+    post_process_method = _resolve(args.post_process_method, config, "post_process_method", _DEFAULTS["post_process_method"])
+    knn_neighbors = _resolve(args.knn_neighbors, config, "knn_neighbors", _DEFAULTS["knn_neighbors"])
+    distance_metric = _resolve(args.distance_metric, config, "distance_metric", _DEFAULTS["distance_metric"])
+    fallback = _resolve(args.fallback, config, "fallback", _DEFAULTS["fallback"])
+    force_generate = _resolve(args.force_generate, config, "force_generate", _DEFAULTS["force_generate"])
+    encoder_dir = _resolve(args.encoder_dir, config, "encoder_dir", _DEFAULTS["encoder_dir"])
+    output_dir = _resolve(args.output_dir, config, "output_dir", _DEFAULTS["output_dir"])
+
+    # --params is a JSON string on the CLI, but config's "params" key is
+    # already a native mapping (YAML parses nested dicts directly).
+    if args.params is not None:
+        parameters = json.loads(args.params)
+    else:
+        parameters = config.get("params", _DEFAULTS["params"])
+
+    missing = [
+        name for name, value in [
+            ("--training-file", training_file),
+            ("--population-file", population_file),
+            ("--metadata-file", metadata_file),
+            ("--encoding-config", encoding_config_file),
+            ("--model-type", model_type),
+        ] if value is None
+    ]
+    if missing:
+        raise SystemExit(
+            f"Missing required setting(s) (pass via CLI flag or --config): {', '.join(missing)}"
+        )
+    if model_type not in VALID_MODEL_TYPES:
+        raise SystemExit(f"Invalid model_type {model_type!r} (choices: {sorted(VALID_MODEL_TYPES)})")
+    if post_process_method not in VALID_POST_PROCESS_METHODS:
+        raise SystemExit(f"Invalid post_process_method {post_process_method!r} (choices: {sorted(VALID_POST_PROCESS_METHODS)})")
+    if fallback not in VALID_FALLBACKS:
+        raise SystemExit(f"Invalid fallback {fallback!r} (choices: {sorted(VALID_FALLBACKS)})")
 
     sdg_pipeline(
-        training_file=args.training_file,
-        population_file=args.population_file,
-        metadata_file=args.metadata_file,
-        encoding_config_file=args.encoding_config,
-        model_type=args.model_type,
-        library=args.library,
-        seed=args.seed,
+        training_file=training_file,
+        population_file=population_file,
+        metadata_file=metadata_file,
+        encoding_config_file=encoding_config_file,
+        model_type=model_type,
+        library=library,
+        seed=seed,
         parameters=parameters,
-        reference_file=args.reference_file,
-        n_samples=args.n_samples,
-        post_process_method=args.post_process_method,
-        knn_neighbors=args.knn_neighbors,
-        distance_metric=args.distance_metric,
-        fallback=args.fallback,
-        force_generate=args.force_generate,
-        encoder_dir=args.encoder_dir,
-        output_dir=args.output_dir,
+        reference_file=reference_file,
+        n_samples=n_samples,
+        post_process_method=post_process_method,
+        knn_neighbors=knn_neighbors,
+        distance_metric=distance_metric,
+        fallback=fallback,
+        force_generate=bool(force_generate),
+        encoder_dir=encoder_dir,
+        output_dir=output_dir,
     )

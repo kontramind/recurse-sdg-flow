@@ -10,6 +10,10 @@ __pycache__/
 /Step5/
 /outputs/
 
+# synthcity's own internal metric-caching scratch dir (created at import/fit
+# time by ARF's early-stopping detection metric, not something we produce)
+/workspace/
+
 # Prefect / temp config
 params._prefect_*.yaml
 *.backup
