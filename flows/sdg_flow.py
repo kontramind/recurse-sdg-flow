@@ -18,9 +18,9 @@ verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
 encode_evaluation, hallucination_evaluation, tstr_evaluation,
 privacy_evaluation, detection_evaluation, statistical_similarity
 (table_structure, semantic_structure, boundary_adherence,
-category_adherence, alpha_precision, prdc_score, jensenshannon_syndat,
-ks_complement, tv_complement so far; the remaining statistical sub-metrics
-are added one per commit).
+category_adherence, alpha_precision, prdc_score, the three
+jensenshannon_* variants, ks_complement, tv_complement so far; the
+remaining statistical sub-metrics are added one per commit).
 
 Usage:
     python flows/sdg_flow.py \\
@@ -1220,7 +1220,9 @@ def sdg_pipeline(
             {"name": "category_adherence", "parameters": {"target_columns": None}},
             {"name": "alpha_precision", "parameters": {}},
             {"name": "prdc_score", "parameters": {"nearest_k": 5}},
+            {"name": "jensenshannon_synthcity", "parameters": {"normalize": True, "n_histogram_bins": 10}},
             {"name": "jensenshannon_syndat", "parameters": {"n_unique_threshold": 10}},
+            {"name": "jensenshannon_nannyml", "parameters": {}},
             {"name": "ks_complement", "parameters": {"target_columns": None}},
             {"name": "tv_complement", "parameters": {"target_columns": None}},
         ]

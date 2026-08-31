@@ -21,6 +21,9 @@ one metric at a time (the port is being built incrementally); each
   prdc_score         -> PRDCScoreMetric          (synthcity.metrics.eval_statistical.PRDCScore)
   jensenshannon_syndat -> JensenShannonSyndatMetric  (syndat.metrics.jensen_shannon_distance)
     -- the strictest JSD variant; the one the paper reports.
+  jensenshannon_synthcity -> JensenShannonSynthcityMetric  (synthcity JensenShannonDistance)
+  jensenshannon_nannyml   -> JensenShannonNannyMLMetric    (scipy Doane-binned JSD; the
+    module-level `from nannyml...` import in sdpype is dead code and is NOT carried)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -49,7 +52,11 @@ from sdmetrics.single_column import (
 )
 from sdmetrics.single_table import TableStructure
 from syndat.metrics import jensen_shannon_distance as syndat_jsd
-from synthcity.metrics.eval_statistical import AlphaPrecision, PRDCScore
+from synthcity.metrics.eval_statistical import (
+    AlphaPrecision,
+    JensenShannonDistance,
+    PRDCScore,
+)
 from synthcity.plugins.core.dataloader import GenericDataLoader
 
 
@@ -1065,6 +1072,73 @@ class PRDCScoreMetric:
             }
 
 
+class JensenShannonSynthcityMetric:
+    """Jensen-Shannon Distance metric implementation (Synthcity)"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        normalize = parameters.get("normalize", True)
+        n_histogram_bins = parameters.get("n_histogram_bins", 10)
+        self.evaluator = JensenShannonDistance(normalize=normalize, n_histogram_bins=n_histogram_bins)
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate Jensen-Shannon Distance metric using Synthcity"""
+        start_time = time.time()
+
+        try:
+            # Use encoding config as source of truth for which columns are numeric
+            if encoding_config:
+                usable_cols = get_encoded_numeric_columns(encoding_config, original, metadata)
+                log_column_selection("Jensen-Shannon Distance (Synthcity)", encoding_config, original, metadata, usable_cols)
+            else:
+                # Fallback to old logic if no encoding config provided
+                numeric_cols = get_columns_by_sdtype(metadata, ['numerical'])
+                datetime_cols = get_columns_by_sdtype(metadata, ['datetime'])
+                categorical_cols = get_columns_by_sdtype(metadata, ['categorical'])
+                numeric_categorical_cols = [
+                    col for col in categorical_cols
+                    if pd.api.types.is_numeric_dtype(original[col])
+                ]
+                usable_cols = numeric_cols + datetime_cols + numeric_categorical_cols
+                print(f"  Jensen-Shannon Distance (Synthcity) using {len(usable_cols)} columns (fallback mode)")
+
+            if not usable_cols:
+                raise ValueError("No numeric columns found for Jensen-Shannon Distance metric")
+
+            # Select only usable columns
+            original_numeric = original[usable_cols].copy()
+            synthetic_numeric = synthetic[usable_cols].copy()
+
+            # Create data loaders
+            real_loader = GenericDataLoader(original_numeric)
+            synth_loader = GenericDataLoader(synthetic_numeric)
+
+            # Run evaluation
+            result = self.evaluator.evaluate(real_loader, synth_loader)
+
+            # JSD returns raw distance (0-1, lower=better)
+            raw_distance = float(result.get("marginal", 0.0))
+
+            return {
+                "distance_score": raw_distance,
+                "normalize": self.parameters.get("normalize", True),
+                "n_histogram_bins": self.parameters.get("n_histogram_bins", 10),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "distance_score": 1.0,
+                "normalize": self.parameters.get("normalize", True),
+                "n_histogram_bins": self.parameters.get("n_histogram_bins", 10),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
 class JensenShannonSyndatMetric:
     """Jensen-Shannon Distance metric implementation (SYNDAT)"""
 
@@ -1095,6 +1169,124 @@ class JensenShannonSyndatMetric:
             return {
                 "distance_score": 1.0,
                 "n_unique_threshold": self.n_unique_threshold,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
+class JensenShannonNannyMLMetric:
+    """Jensen-Shannon Distance metric implementation (NannyML)"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate Jensen-Shannon Distance metric using NannyML's binning methodology"""
+        start_time = time.time()
+
+        try:
+            column_scores = {}
+
+            # Use encoding config as source of truth for which columns to evaluate
+            if encoding_config:
+                # Get columns that were encoded (all are numeric after encoding)
+                usable_cols = get_encoded_numeric_columns(encoding_config, original, metadata)
+                log_column_selection("Jensen-Shannon Distance (NannyML)", encoding_config, original, metadata, usable_cols)
+
+                # All encoded columns are numeric - use Doane's binning for all
+                for column in usable_cols:
+                    try:
+                        # Continuous feature - use Doane's formula for adaptive binning
+                        n_bins = int(1 + np.log2(len(original)) + np.log2(1 + np.abs(original[column].skew()) / np.sqrt(6 * (len(original) - 2) / ((len(original) + 1) * (len(original) + 3)))))
+                        n_bins = max(10, min(n_bins, 50))  # Bound bins between 10-50
+
+                        # Create bins from original (reference)
+                        bins = np.histogram_bin_edges(original[column].dropna(), bins=n_bins)
+
+                        # Calculate histograms
+                        orig_hist, _ = np.histogram(original[column].dropna(), bins=bins)
+                        synth_hist, _ = np.histogram(synthetic[column].dropna(), bins=bins)
+
+                        # Normalize to get probabilities
+                        orig_prob = orig_hist / orig_hist.sum() if orig_hist.sum() > 0 else orig_hist
+                        synth_prob = synth_hist / synth_hist.sum() if synth_hist.sum() > 0 else synth_hist
+
+                        # Compute JSD
+                        from scipy.spatial.distance import jensenshannon
+                        jsd = jensenshannon(orig_prob, synth_prob)
+
+                        column_scores[column] = float(jsd)
+                    except Exception as e:
+                        # Skip column on failure but continue
+                        continue
+            else:
+                # Fallback mode: iterate all columns and determine type at runtime
+                print(f"  Jensen-Shannon Distance (NannyML) using fallback mode (no encoding config)")
+                for column in original.columns:
+                    try:
+                        # Determine if column is continuous or categorical
+                        if pd.api.types.is_numeric_dtype(original[column]):
+                            # Continuous feature - use Doane's formula for binning
+                            n_bins = int(1 + np.log2(len(original)) + np.log2(1 + np.abs(original[column].skew()) / np.sqrt(6 * (len(original) - 2) / ((len(original) + 1) * (len(original) + 3)))))
+                            n_bins = max(10, min(n_bins, 50))  # Bound bins between 10-50
+
+                            # Create bins from original (reference)
+                            bins = np.histogram_bin_edges(original[column].dropna(), bins=n_bins)
+
+                            # Calculate histograms
+                            orig_hist, _ = np.histogram(original[column].dropna(), bins=bins)
+                            synth_hist, _ = np.histogram(synthetic[column].dropna(), bins=bins)
+
+                            # Normalize to get probabilities
+                            orig_prob = orig_hist / orig_hist.sum() if orig_hist.sum() > 0 else orig_hist
+                            synth_prob = synth_hist / synth_hist.sum() if synth_hist.sum() > 0 else synth_hist
+
+                            # Compute JSD
+                            from scipy.spatial.distance import jensenshannon
+                            jsd = jensenshannon(orig_prob, synth_prob)
+
+                        else:
+                            # Categorical feature - use frequency counts
+                            orig_counts = original[column].value_counts(normalize=True)
+                            synth_counts = synthetic[column].value_counts(normalize=True)
+
+                            # Align categories
+                            all_cats = orig_counts.index.union(synth_counts.index)
+                            orig_prob = orig_counts.reindex(all_cats, fill_value=0).values
+                            synth_prob = synth_counts.reindex(all_cats, fill_value=0).values
+
+                            from scipy.spatial.distance import jensenshannon
+                            jsd = jensenshannon(orig_prob, synth_prob)
+
+                        column_scores[column] = float(jsd)
+
+                    except Exception as e:
+                        # Skip column on failure but continue
+                        continue
+
+            # Calculate aggregate distance, lower=better
+            if column_scores:
+                raw_distance = float(np.mean(list(column_scores.values())))
+            else:
+                raw_distance = 1.0
+
+            return {
+                "distance_score": raw_distance,
+                "n_columns_evaluated": len(column_scores),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            # print(f"\n🔴 NannyML ERROR: {e}")
+            # import traceback
+            # traceback.print_exc()
+
+            return {
+                "distance_score": 1.0,
+                "n_columns_evaluated": 0,
                 "parameters": self.parameters,
                 "execution_time": time.time() - start_time,
                 "status": "error",
@@ -1246,8 +1438,12 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return AlphaPrecisionMetric(**parameters)
         case "prdc_score":
             return PRDCScoreMetric(**parameters)
+        case "jensenshannon_synthcity":
+            return JensenShannonSynthcityMetric(**parameters)
         case "jensenshannon_syndat":
             return JensenShannonSyndatMetric(**parameters)
+        case "jensenshannon_nannyml":
+            return JensenShannonNannyMLMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 
