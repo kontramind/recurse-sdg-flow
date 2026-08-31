@@ -16,7 +16,7 @@ The evaluation stages from sdpype's own "# Evaluation tasks" marker onward
 TSTR + report) are being ported incrementally, one stage per commit, each
 verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
 encode_evaluation, hallucination_evaluation, tstr_evaluation,
-privacy_evaluation.
+privacy_evaluation, detection_evaluation.
 
 Usage:
     python flows/sdg_flow.py \\
@@ -44,6 +44,7 @@ from prefect import flow, task
 from sdv.metadata import SingleTableMetadata
 
 from flows.lgbm_cv_flow import encode_features, evaluate_on_test, train_final_model
+from sdg_core.detection import evaluate_detection_metrics, generate_detection_report
 from sdg_core.downstream import LGBMBayesianTuner
 from sdg_core.encoding import RDTDatasetEncoder, load_encoding_config
 from sdg_core.generation import apply_post_processing
@@ -59,6 +60,7 @@ from sdg_core.hashing import calculate_file_hash
 from sdg_core.metadata import load_csv_with_metadata
 from sdg_core.privacy import evaluate_privacy_metrics, generate_privacy_report
 from sdg_core.serialization import create_model_metadata, load_model, save_model
+from sdg_core.statistical import ensure_json_serializable
 from sdg_core.training import create_experiment_hash, create_synthcity_model
 
 
@@ -954,8 +956,73 @@ def privacy_evaluation(
     return result
 
 
+@task(name="detection-evaluation", log_prints=True)
+def detection_evaluation(
+    metadata_file: str,
+    encoding_config_file: str,
+    encoded_reference_path: str,
+    encoded_synthetic_path: str,
+    base_name: str,
+    output_dir: str,
+    methods: list,
+    common_params: dict,
+    force: bool = False,
+) -> dict:
+    """
+    Detection metrics — synthcity's real-vs-synthetic C2ST classifiers
+    (GMM / XGB / MLP / Linear), each a k-fold AUC, plus a mean-of-4 ensemble.
+    Runs on ENCODED (all-numeric) data with ID columns excluded.
+
+    Ported from sdpype flows/sdg_flow.py::detection_evaluation — flat args
+    instead of a cfg dict, base_name for experiment_name, sd-lake metrics/
+    layout. Consumes encode_evaluation's encoded reference + synthetic.
+    """
+    metadata_file = Path(metadata_file)
+    encoding_config_path = Path(encoding_config_file)
+    encoded_reference_path = Path(encoded_reference_path)
+    encoded_synthetic_path = Path(encoded_synthetic_path)
+
+    for p in (metadata_file, encoded_reference_path, encoded_synthetic_path):
+        if not p.exists():
+            raise FileNotFoundError(f"Required file not found: {p}")
+
+    metrics_dir = Path(output_dir) / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"detection_evaluation_{base_name}.json"
+    report_path = metrics_dir / f"detection_report_{base_name}.txt"
+
+    result = {"metrics_path": str(metrics_path), "report_path": str(report_path)}
+    if not force and metrics_path.exists():
+        print(f"Reusing existing detection metrics: {metrics_path}")
+        return result
+
+    metadata = SingleTableMetadata.load_from_json(str(metadata_file))
+    reference_data = pd.read_csv(encoded_reference_path)
+    synthetic_data = pd.read_csv(encoded_synthetic_path)
+    print(f"Loaded encoded reference {reference_data.shape}, synthetic {synthetic_data.shape}")
+
+    encoding_config = None
+    if encoding_config_path.exists():
+        encoding_config = load_encoding_config(encoding_config_path)
+
+    print(f"Running {len(methods)} detection method(s) ...  common_params={common_params}")
+    results = evaluate_detection_metrics(
+        reference_data, synthetic_data, metadata, methods, common_params,
+        base_name, encoding_config,
+    )
+    results = ensure_json_serializable(results)
+
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    report_path.write_text(generate_detection_report(results), encoding="utf-8")
+
+    print(f"Saved detection metrics → {metrics_path}")
+    print(f"Saved detection report  → {report_path}")
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Flow — encode → train → generate → evaluation-encode → hallucination → TSTR → privacy
+# Flow — encode → train → generate → evaluation-encode → hallucination → TSTR → privacy → detection
 # ---------------------------------------------------------------------------
 
 @flow(name="sdg-pipeline")
@@ -977,6 +1044,8 @@ def sdg_pipeline(
     force_generate: bool = False,
     hallucination_num_bins: int = 20,
     privacy_qi_columns: Optional[list] = None,
+    detection_methods: Optional[list] = None,
+    detection_common_params: Optional[dict] = None,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
@@ -989,6 +1058,14 @@ def sdg_pipeline(
     # via --privacy-qi-columns or evaluation.privacy.metrics[0].parameters.
     if privacy_qi_columns is None:
         privacy_qi_columns = ["age", "gender", "ethnicity", "admission_type"]
+    # Step7 detection config (evaluation.detection_evaluation in the yaml).
+    if detection_methods is None:
+        detection_methods = [
+            {"name": n, "parameters": {}}
+            for n in ("detection_gmm", "detection_xgb", "detection_mlp", "detection_linear")
+        ]
+    if detection_common_params is None:
+        detection_common_params = {"n_folds": 5, "random_state": 987, "reduction": "max"}
 
     run_params = {
         "training_file": training_file,
@@ -1100,6 +1177,18 @@ def sdg_pipeline(
         force=force_generate,
     )
 
+    detection_out = detection_evaluation(
+        metadata_file=metadata_file,
+        encoding_config_file=encoding_config_file,
+        encoded_reference_path=eval_encode_out["encoded_reference"],
+        encoded_synthetic_path=eval_encode_out["encoded_synthetic"],
+        base_name=base_name,
+        output_dir=output_dir,
+        methods=detection_methods,
+        common_params=detection_common_params,
+        force=force_generate,
+    )
+
     return {
         "fit_encoder": fit_out,
         "encode_data": encode_out,
@@ -1109,6 +1198,7 @@ def sdg_pipeline(
         "hallucination": halluc_out,
         "tstr": tstr_out,
         "privacy": privacy_out,
+        "detection": detection_out,
     }
 
 
@@ -1183,7 +1273,7 @@ def _pick(cli_value, config: dict, dotted: str, default=None):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the SDG pipeline (encode -> train -> generate -> encode_evaluation -> hallucination -> tstr -> privacy)",
+        description="Run the SDG pipeline (encode -> train -> generate -> encode_evaluation -> hallucination -> tstr -> privacy -> detection)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="Optional path to a plain YAML config file; CLI flags below override it")
@@ -1255,6 +1345,11 @@ if __name__ == "__main__":
             if _priv_metrics else None
         )  # None -> sdg_pipeline() falls back to the pf_all QI set
 
+    # Detection is config-only (no flat-CLI shape); None -> sdg_pipeline()
+    # falls back to the Step7 methods / common_params.
+    detection_methods = _cfg_get(config, "evaluation.detection_evaluation.methods", None)
+    detection_common_params = _cfg_get(config, "evaluation.detection_evaluation.common_params", None)
+
     # --params is a JSON string on the CLI; sdg.parameters in the config is
     # already a native mapping (YAML parses nested dicts directly).
     if args.params is not None:
@@ -1301,6 +1396,8 @@ if __name__ == "__main__":
         force_generate=bool(force_generate),
         hallucination_num_bins=hallucination_num_bins,
         privacy_qi_columns=privacy_qi_columns,
+        detection_methods=detection_methods,
+        detection_common_params=detection_common_params,
         encoder_dir=encoder_dir,
         output_dir=output_dir,
     )
