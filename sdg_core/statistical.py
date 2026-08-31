@@ -31,6 +31,12 @@ one metric at a time (the port is being built incrementally); each
   wasserstein_distance -> WassersteinDistanceMetric  (custom CPU Sinkhorn OT via
     geomloss.SamplesLoss on MinMax-scaled tensors — NOT synthcity's WassersteinDistance;
     iterative, so match is close but not guaranteed bit-exact)
+  sdmetrics_quality  -> SDMetricsQualityMetric  (sdmetrics.reports.single_table.
+    QualityReport with the working-tree SpearmanColumnPairTrends(ColumnPairTrends)
+    override — Column-Pair-Trends CorrelationSimilarity forced to Spearman via the
+    private _properties/_compute_average/_compute_pair_score API — plus custom
+    Spearman / Cramér-V / correlation-ratio matrices. This is why sdmetrics==0.28.0
+    is pinned.)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -58,7 +64,7 @@ Uses the real sdv.metadata.SingleTableMetadata.
 
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -66,6 +72,9 @@ import torch
 from sdv.metadata import SingleTableMetadata
 
 from geomloss import SamplesLoss
+from scipy.stats import chi2_contingency, spearmanr
+from sdmetrics.reports.single_table import QualityReport
+from sdmetrics.reports.single_table._properties.column_pair_trends import ColumnPairTrends
 from sdmetrics.single_column import (
     BoundaryAdherence,
     CategoryAdherence,
@@ -1593,6 +1602,280 @@ class NewRowSynthesisMetric:
             }
 
 
+class SpearmanColumnPairTrends(ColumnPairTrends):
+    def _compute_pair_score(self, metric, col_real, col_synthetic, metric_params):
+        if metric.__name__ == 'CorrelationSimilarity':
+            metric_params = dict(metric_params)
+            metric_params['coefficient'] = 'Spearman'
+        return super()._compute_pair_score(metric, col_real, col_synthetic, metric_params)
+
+
+class SDMetricsQualityMetric:
+    """
+    SDMetrics comprehensive quality analysis with correlation matrices.
+
+    Evaluates:
+    - Column Shapes (distribution similarity using KS test, TV distance, etc.)
+    - Column Pair Trends (correlation preservation across column pairs)
+
+    Generates three correlation matrices:
+    1. Real data correlations (with pairwise deletion and confidence metrics)
+    2. Synthetic data correlations (complete data analysis)
+    3. Quality scores (SDMetrics similarity assessment)
+
+    Uses pairwise deletion to handle missing values in real data.
+    Supports mixed data types (numerical, categorical, boolean).
+    """
+
+    def __init__(self, max_display_cols: int = 10, **parameters):
+        """
+        Initialize SDMetrics Quality metric.
+
+        Args:
+            max_display_cols: Maximum number of columns to display in matrices
+            **parameters: Additional parameters (reserved for future use)
+        """
+        self.max_display_cols = max_display_cols
+        self.parameters = parameters
+
+    def _cramers_v(self, x: pd.Series, y: pd.Series) -> float:
+        """Calculate Cramér's V statistic for categorical-categorical association."""
+        confusion_matrix = pd.crosstab(x, y)
+        chi2 = chi2_contingency(confusion_matrix)[0]
+        n = confusion_matrix.sum().sum()
+        min_dim = min(confusion_matrix.shape) - 1
+
+        if min_dim == 0:
+            return 0.0
+
+        return np.sqrt(chi2 / (n * min_dim)) if n > 0 else 0.0
+
+    def _correlation_ratio(self, categories: pd.Series, values: pd.Series) -> float:
+        """Calculate correlation ratio (eta) for categorical-numerical association."""
+        categories = categories.fillna('Missing')
+        values = values.fillna(values.mean())
+
+        categories = pd.Categorical(categories)
+        grouped_mean = values.groupby(categories, observed=True).mean()
+        overall_mean = values.mean()
+        group_counts = values.groupby(categories, observed=True).size()
+
+        ss_between = ((grouped_mean - overall_mean) ** 2 * group_counts).sum()
+        ss_total = ((values - overall_mean) ** 2).sum()
+
+        if ss_total == 0:
+            return 0.0
+
+        return np.sqrt(ss_between / ss_total)
+
+    def _compute_correlation_matrix(
+        self,
+        data: pd.DataFrame,
+        metadata: dict,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Compute correlation matrix using pairwise deletion.
+
+        Args:
+            data: DataFrame to analyze
+            metadata: SDV metadata dictionary
+
+        Returns:
+            Tuple of (correlation_matrix, sample_size_matrix)
+        """
+        columns = list(data.columns)
+        corr_matrix = pd.DataFrame(index=columns, columns=columns, dtype=float)
+        sample_matrix = pd.DataFrame(index=columns, columns=columns, dtype=int)
+
+        sdtypes = {col: metadata['columns'][col]['sdtype'] for col in columns}
+
+        for i, col1 in enumerate(columns):
+            for col2 in columns[i:]:
+                if col1 == col2:
+                    corr_matrix.loc[col1, col2] = 1.0
+                    sample_matrix.loc[col1, col2] = len(data)
+                    continue
+
+                sdtype1 = sdtypes[col1].lower()
+                sdtype2 = sdtypes[col2].lower()
+
+                # Skip datetime columns
+                if sdtype1 == 'datetime' or sdtype2 == 'datetime':
+                    corr_matrix.loc[col1, col2] = np.nan
+                    corr_matrix.loc[col2, col1] = np.nan
+                    sample_matrix.loc[col1, col2] = 0
+                    sample_matrix.loc[col2, col1] = 0
+                    continue
+
+                try:
+                    # Pairwise deletion: only rows where BOTH columns are not null
+                    valid_mask = data[[col1, col2]].notna().all(axis=1)
+                    n_valid = valid_mask.sum()
+
+                    if n_valid < 2:  # Need at least 2 samples
+                        corr_matrix.loc[col1, col2] = np.nan
+                        corr_matrix.loc[col2, col1] = np.nan
+                        sample_matrix.loc[col1, col2] = n_valid
+                        sample_matrix.loc[col2, col1] = n_valid
+                        continue
+
+                    data1 = data.loc[valid_mask, col1]
+                    data2 = data.loc[valid_mask, col2]
+
+                    # Both numerical - Spearman
+                    if sdtype1 == 'numerical' and sdtype2 == 'numerical':
+                        corr, _ = spearmanr(data1, data2)
+                        corr_matrix.loc[col1, col2] = abs(corr)
+                        corr_matrix.loc[col2, col1] = abs(corr)
+
+                    # Both categorical - Cramér's V
+                    elif sdtype1 in ['categorical', 'boolean'] and sdtype2 in ['categorical', 'boolean']:
+                        v = self._cramers_v(data1, data2)
+                        corr_matrix.loc[col1, col2] = v
+                        corr_matrix.loc[col2, col1] = v
+
+                    # Mixed - Correlation ratio
+                    else:
+                        if sdtype1 in ['categorical', 'boolean']:
+                            eta = self._correlation_ratio(data1, data2)
+                        else:
+                            eta = self._correlation_ratio(data2, data1)
+
+                        corr_matrix.loc[col1, col2] = eta
+                        corr_matrix.loc[col2, col1] = eta
+
+                    sample_matrix.loc[col1, col2] = n_valid
+                    sample_matrix.loc[col2, col1] = n_valid
+
+                except Exception:
+                    corr_matrix.loc[col1, col2] = np.nan
+                    corr_matrix.loc[col2, col1] = np.nan
+                    sample_matrix.loc[col1, col2] = 0
+                    sample_matrix.loc[col2, col1] = 0
+
+        return corr_matrix, sample_matrix
+
+    def _build_quality_pair_matrix(self, report: QualityReport) -> pd.DataFrame:
+        """Extract pairwise quality scores from QualityReport."""
+        details = report.get_details('Column Pair Trends')
+
+        all_cols = sorted(set(details['Column 1'].unique()) | set(details['Column 2'].unique()))
+        matrix = pd.DataFrame(index=all_cols, columns=all_cols, dtype=float)
+
+        for _, row in details.iterrows():
+            col1, col2 = row['Column 1'], row['Column 2']
+            score = row['Score']
+            matrix.loc[col1, col2] = score
+            matrix.loc[col2, col1] = score
+
+        for col in all_cols:
+            matrix.loc[col, col] = 1.0
+
+        return matrix
+
+    def evaluate(self,
+                 original: pd.DataFrame,
+                 synthetic: pd.DataFrame,
+                 metadata: SingleTableMetadata,
+                 encoding_config: dict = None) -> Dict[str, Any]:
+        """
+        Evaluate using SDMetrics QualityReport.
+
+        Args:
+            original: Original/reference dataset (decoded)
+            synthetic: Synthetic dataset (decoded)
+            metadata: SDV metadata object
+            encoding_config: Optional encoding configuration (unused)
+
+        Returns:
+            Dictionary with:
+            - status: "success" or "error"
+            - score: Overall quality score (0-1)
+            - property_scores: Column Shapes and Column Pair Trends scores
+            - matrices: Real/synthetic correlations and quality scores
+            - diagnostics: Pairwise diagnostic information
+            - null_values: Null count information
+            - column_shapes_details: Per-column distribution scores
+            - execution_time: Time taken in seconds
+        """
+        start_time = time.time()
+
+        try:
+            metadata_dict = metadata.to_dict()
+
+            # Generate SDMetrics QualityReport (Column Pair Trends uses Spearman)
+            report = QualityReport()
+            report._properties['Column Pair Trends'] = SpearmanColumnPairTrends()
+            report.generate(original, synthetic, metadata_dict, verbose=False)
+
+            # Compute correlation matrices
+            real_matrix, real_samples = self._compute_correlation_matrix(original, metadata_dict)
+            synth_matrix, synth_samples = self._compute_correlation_matrix(synthetic, metadata_dict)
+            quality_matrix = self._build_quality_pair_matrix(report)
+
+            # Get property scores
+            column_shapes_score = report._properties["Column Shapes"]._compute_average()
+            column_pair_trends_score = report._properties["Column Pair Trends"]._compute_average()
+            overall_score = report.get_score()
+
+            # Get column shapes details
+            column_shapes_details = report.get_details('Column Shapes').to_dict(orient='records')
+
+            # Build diagnostics for each pair
+            cols = sorted(real_matrix.columns)
+            diagnostics = {}
+
+            for i, col1 in enumerate(cols):
+                for col2 in cols[i+1:]:
+                    pair_key = f"{col1}×{col2}"
+
+                    real_corr = float(real_matrix.loc[col1, col2]) if not pd.isna(real_matrix.loc[col1, col2]) else None
+                    n_samples = int(real_samples.loc[col1, col2])
+                    synth_corr = float(synth_matrix.loc[col1, col2]) if not pd.isna(synth_matrix.loc[col1, col2]) else None
+                    quality_score = float(quality_matrix.loc[col1, col2]) if not pd.isna(quality_matrix.loc[col1, col2]) else None
+
+                    if all(x is not None for x in [real_corr, synth_corr, quality_score]):
+                        diagnostics[pair_key] = {
+                            "column_1": col1,
+                            "column_2": col2,
+                            "real_correlation": real_corr,
+                            "real_n_samples": n_samples,
+                            "synthetic_correlation": synth_corr,
+                            "quality_score": quality_score,
+                        }
+
+            return {
+                "status": "success",
+                "score": float(overall_score),
+                "property_scores": {
+                    "column_shapes": float(column_shapes_score),
+                    "column_pair_trends": float(column_pair_trends_score),
+                },
+                "matrices": {
+                    "real_correlations": real_matrix.to_dict(),
+                    "real_sample_sizes": real_samples.to_dict(),
+                    "synthetic_correlations": synth_matrix.to_dict(),
+                    "quality_scores": quality_matrix.to_dict(),
+                },
+                "diagnostics": diagnostics,
+                "null_values": {
+                    "real_data": original.isnull().sum().to_dict(),
+                    "synthetic_data": synthetic.isnull().sum().to_dict(),
+                },
+                "column_shapes_details": column_shapes_details,
+                "parameters": {"max_display_cols": self.max_display_cols, **self.parameters},
+                "execution_time": time.time() - start_time,
+            }
+
+        except Exception as e:
+            return {
+                "status": "error",
+                "error_message": str(e),
+                "parameters": {"max_display_cols": self.max_display_cols, **self.parameters},
+                "execution_time": time.time() - start_time,
+            }
+
+
 # ===========================================================================
 # Dispatch
 # ===========================================================================
@@ -1749,6 +2032,8 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return NewRowSynthesisMetric(**parameters)
         case "wasserstein_distance":
             return WassersteinDistanceMetric(**parameters)
+        case "sdmetrics_quality":
+            return SDMetricsQualityMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 

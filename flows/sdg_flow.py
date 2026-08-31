@@ -20,8 +20,8 @@ privacy_evaluation, detection_evaluation, statistical_similarity
 (table_structure, semantic_structure, boundary_adherence,
 category_adherence, alpha_precision, prdc_score, the three
 jensenshannon_* variants, maximum_mean_discrepancy (corrected),
-new_row_synthesis, wasserstein_distance, ks_complement, tv_complement so
-far; the remaining statistical sub-metrics are added one per commit).
+new_row_synthesis, wasserstein_distance, ks_complement, tv_complement,
+sdmetrics_quality — all 15 statistical sub-metrics now ported).
 
 Usage:
     python flows/sdg_flow.py \\
@@ -1235,6 +1235,11 @@ def sdg_pipeline(
             {"name": "new_row_synthesis", "parameters": {"numerical_match_tolerance": 0.01, "synthetic_sample_size": None}},
             {"name": "ks_complement", "parameters": {"target_columns": None}},
             {"name": "tv_complement", "parameters": {"target_columns": None}},
+            # QualityReport + working-tree SpearmanColumnPairTrends override. The
+            # config carries max_display_cols as a sibling of `name` (not under
+            # parameters), so it never reaches the constructor -> the block always
+            # reports max_display_cols=10, matching sd-lake.
+            {"name": "sdmetrics_quality", "parameters": {}},
         ]
 
     # Run-directory wrapper: every run nests under output_dir/<run_name>/ so
