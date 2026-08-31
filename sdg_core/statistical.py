@@ -8,29 +8,28 @@ Top section: the shared column-selection helpers that sdpype/evaluation/
 detection.py also imports (ensure_json_serializable, get_columns_by_sdtype,
 get_encoded_numeric_columns, log_column_selection) — verbatim.
 
-Lower section: the statistical_similarity metric implementations. Ported
-one metric at a time (the port is being built incrementally); each
-`get_metric_evaluator` case is added with its class. Currently ported:
-  ks_complement      -> KSComplementMetric       (sdmetrics.single_column.KSComplement)
-  tv_complement      -> TVComplementMetric       (sdmetrics.single_column.TVComplement)
-  boundary_adherence -> BoundaryAdherenceMetric  (sdmetrics.single_column.BoundaryAdherence)
-  category_adherence -> CategoryAdherenceMetric  (sdmetrics.single_column.CategoryAdherence)
+Lower section: the statistical_similarity metric implementations. All 15
+sub-metrics are ported (they were added one metric per commit); each has a
+`get_metric_evaluator` case. Listed below in sd-lake JSON order:
   table_structure    -> TableStructureMetric     (sdmetrics.single_table.TableStructure + pandas-dtype table)
   semantic_structure -> SemanticStructureMetric  (pure-python metadata sdtype compare)
+  boundary_adherence -> BoundaryAdherenceMetric  (sdmetrics.single_column.BoundaryAdherence)
+  category_adherence -> CategoryAdherenceMetric  (sdmetrics.single_column.CategoryAdherence)
   alpha_precision    -> AlphaPrecisionMetric     (synthcity.metrics.eval_statistical.AlphaPrecision)
   prdc_score         -> PRDCScoreMetric          (synthcity.metrics.eval_statistical.PRDCScore)
-  jensenshannon_syndat -> JensenShannonSyndatMetric  (syndat.metrics.jensen_shannon_distance)
-    -- the strictest JSD variant; the one the paper reports.
-  jensenshannon_synthcity -> JensenShannonSynthcityMetric  (synthcity JensenShannonDistance)
-  jensenshannon_nannyml   -> JensenShannonNannyMLMetric    (scipy Doane-binned JSD; the
-    module-level `from nannyml...` import in sdpype is dead code and is NOT carried)
+  wasserstein_distance -> WassersteinDistanceMetric  (custom CPU Sinkhorn OT via
+    geomloss.SamplesLoss on MinMax-scaled tensors — NOT synthcity's WassersteinDistance)
   maximum_mean_discrepancy -> MaximumMeanDiscrepancyMetric  (corrected MMD, NOT synthcity's
     — see the module docstring)
   new_row_synthesis  -> NewRowSynthesisMetric  (sdmetrics.single_table.NewRowSynthesis
     compute_breakdown; synthetic_sample_size stays null — what made the ground truth)
-  wasserstein_distance -> WassersteinDistanceMetric  (custom CPU Sinkhorn OT via
-    geomloss.SamplesLoss on MinMax-scaled tensors — NOT synthcity's WassersteinDistance;
-    iterative, so match is close but not guaranteed bit-exact)
+  jensenshannon_synthcity -> JensenShannonSynthcityMetric  (synthcity JensenShannonDistance)
+  jensenshannon_syndat -> JensenShannonSyndatMetric  (syndat.metrics.jensen_shannon_distance)
+    -- the strictest JSD variant; the one the paper reports.
+  jensenshannon_nannyml   -> JensenShannonNannyMLMetric    (scipy Doane-binned JSD; the
+    module-level `from nannyml...` import in sdpype is dead code and is NOT carried)
+  ks_complement      -> KSComplementMetric       (sdmetrics.single_column.KSComplement)
+  tv_complement      -> TVComplementMetric       (sdmetrics.single_column.TVComplement)
   sdmetrics_quality  -> SDMetricsQualityMetric  (sdmetrics.reports.single_table.
     QualityReport with the working-tree SpearmanColumnPairTrends(ColumnPairTrends)
     override — Column-Pair-Trends CorrelationSimilarity forced to Spearman via the
@@ -39,7 +38,8 @@ one metric at a time (the port is being built incrementally); each
     is pinned.)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
-already handle every metric name; only the factory grows per commit.
+handle every metric name; `get_metric_evaluator`'s `case _` still raises
+(an unknown/unported metric fails loudly rather than degrading silently).
 
 Differences from sdpype: the 2 `OmegaConf.is_config(parameters)` lines in
 `evaluate_statistical_metrics` are dropped (no Hydra here); the module-level

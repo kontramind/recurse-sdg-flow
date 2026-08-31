@@ -1209,10 +1209,12 @@ def sdg_pipeline(
         ]
     if detection_common_params is None:
         detection_common_params = {"n_folds": 5, "random_state": 987, "reduction": "max"}
-    # evaluation.statistical_similarity.metrics in the yaml. The full Step7
-    # list has 15 entries; the port wires them one at a time, so this interim
-    # default carries only the metrics already ported (grows per commit until
-    # it is the full list). A --config run passes whatever the yaml lists.
+    # evaluation.statistical_similarity.metrics in the yaml. This built-in
+    # default is the full Step7 set — all 15 sub-metrics, in the same order as
+    # sd-lake's stored statistical_similarity_*.json — with the Step7 parameter
+    # values baked in. A --config run passes whatever the yaml lists instead
+    # (configs/step7_pf_*.yaml carry the same 15 in the same order, and supply
+    # the frozen per-variant MMD gamma the built-in default leaves as None).
     if statistical_metrics is None:
         statistical_metrics = [
             {"name": "table_structure", "parameters": {}},
@@ -1221,9 +1223,6 @@ def sdg_pipeline(
             {"name": "category_adherence", "parameters": {"target_columns": None}},
             {"name": "alpha_precision", "parameters": {}},
             {"name": "prdc_score", "parameters": {"nearest_k": 5}},
-            {"name": "jensenshannon_synthcity", "parameters": {"normalize": True, "n_histogram_bins": 10}},
-            {"name": "jensenshannon_syndat", "parameters": {"n_unique_threshold": 10}},
-            {"name": "jensenshannon_nannyml", "parameters": {}},
             # Custom CPU Sinkhorn OT (geomloss), NOT synthcity's WassersteinDistance.
             {"name": "wasserstein_distance", "parameters": {}},
             # Corrected MMD (not synthcity's degenerate one). gamma=None here ->
@@ -1233,6 +1232,9 @@ def sdg_pipeline(
             # synthetic_sample_size stays None — that is what produced the sd-lake
             # ground truth (and it is ~67s/model at that setting).
             {"name": "new_row_synthesis", "parameters": {"numerical_match_tolerance": 0.01, "synthetic_sample_size": None}},
+            {"name": "jensenshannon_synthcity", "parameters": {"normalize": True, "n_histogram_bins": 10}},
+            {"name": "jensenshannon_syndat", "parameters": {"n_unique_threshold": 10}},
+            {"name": "jensenshannon_nannyml", "parameters": {}},
             {"name": "ks_complement", "parameters": {"target_columns": None}},
             {"name": "tv_complement", "parameters": {"target_columns": None}},
             # QualityReport + working-tree SpearmanColumnPairTrends override. The
@@ -1557,7 +1559,7 @@ if __name__ == "__main__":
     detection_common_params = _cfg_get(config, "evaluation.detection_evaluation.common_params", None)
 
     # Statistical similarity is config-only too; None -> sdg_pipeline() falls
-    # back to its interim built-in list (the metrics ported so far).
+    # back to its built-in list (the full Step7 set of 15 sub-metrics).
     statistical_metrics = _cfg_get(config, "evaluation.statistical_similarity.metrics", None)
 
     # --params is a JSON string on the CLI; sdg.parameters in the config is
