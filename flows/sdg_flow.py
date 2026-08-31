@@ -3,19 +3,19 @@ os.environ.setdefault("DO_NOT_TRACK", "1")
 os.environ.setdefault("PREFECT_SERVER_ANALYTICS_ENABLED", "false")
 
 """
-SDG Pipeline — Prefect flow (encode → train → generate)
-=========================================================
+SDG Pipeline — Prefect flow (encode → train → generate → evaluate)
+=================================================================
 
-Ported from sdpype's flows/sdg_flow.py. Only the first 5 of its 13 tasks are
-in scope for this repo: resolve_config (replaced entirely by argparse — no
-Hydra/YAML template resolution needed), fit_encoder, encode_data, train_sdg,
-generate_synthetic. Everything from sdg_flow.py's own "# Evaluation tasks"
-marker onward (statistical/privacy/detection/hallucination/TSTR + report) is
-a separate, later step — not ported here.
+Ported from sdpype's flows/sdg_flow.py. resolve_config is replaced entirely
+by argparse (no Hydra/YAML template resolution); fit_encoder, encode_data,
+train_sdg and generate_synthetic are the core encode → train → generate
+chain (arf/ctgan/ddpm/rtvae/nflow, synthcity-only).
 
-This checkpoint adds generate_synthetic on top of the already-verified
-fit_encoder + encode_data + train_sdg — the full encode → train → generate
-chain (arf/ctgan/ddpm/rtvae/nflow, synthcity-only) is now wired.
+The evaluation stages from sdpype's own "# Evaluation tasks" marker onward
+(encode_evaluation, then statistical / privacy / detection / hallucination /
+TSTR + report) are being ported incrementally, one stage per commit, each
+verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
+encode_evaluation.
 
 Usage:
     python flows/sdg_flow.py \\
@@ -444,7 +444,145 @@ def generate_synthetic(
 
 
 # ---------------------------------------------------------------------------
-# Flow — full encode → train → generate chain
+# Evaluation tasks
+# ---------------------------------------------------------------------------
+
+@task(name="encode-evaluation", log_prints=True)
+def encode_evaluation(
+    reference_file: str,
+    metadata_file: str,
+    encoding_config_file: str,
+    synthetic_decoded_path: str,
+    base_name: str,
+    output_dir: str,
+    force: bool = False,
+) -> dict:
+    """
+    Fit a fresh RDT encoder on the REFERENCE data and push both reference and
+    synthetic data through it (dual pipeline: encoded + reverse-decoded).
+
+    Unlike encode_data — which loads the shared population encoder — the
+    evaluation encoder is keyed on the reference (real) data, so it captures
+    exactly the categories present in the real comparison set. This is the
+    input stage every downstream statistical / privacy / detection metric
+    consumes. Ported near-verbatim from sdpype flows/sdg_flow.py::encode_evaluation
+    (the only changes: flat args instead of a cfg dict, and the sd-lake
+    data/{encoded,decoded} + models + metrics layout under output_dir).
+    """
+    start_time = time.time()
+    print(f"Base name: {base_name}")
+
+    reference_file = Path(reference_file)
+    metadata_file = Path(metadata_file)
+    encoding_config_path = Path(encoding_config_file)
+    synthetic_decoded_path = Path(synthetic_decoded_path)
+
+    for p in (reference_file, metadata_file, encoding_config_path, synthetic_decoded_path):
+        if not p.exists():
+            raise FileNotFoundError(f"Required file not found: {p}")
+
+    output_dir = Path(output_dir)
+    encoded_dir = output_dir / "data" / "encoded"
+    decoded_dir = output_dir / "data" / "decoded"
+    models_dir = output_dir / "models"
+    metrics_dir = output_dir / "metrics"
+    for d in (encoded_dir, decoded_dir, models_dir, metrics_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    encoded_reference_path = encoded_dir / f"reference_{base_name}.csv"
+    encoded_synthetic_path = encoded_dir / f"synthetic_{base_name}.csv"
+    decoded_reference_path = decoded_dir / f"reference_{base_name}.csv"
+    decoded_synthetic_path = decoded_dir / f"synthetic_{base_name}_decoded.csv"
+    eval_encoder_path = models_dir / f"evaluation_encoder_{base_name}.pkl"
+    metrics_path = metrics_dir / f"encoding_evaluation_{base_name}.json"
+
+    outputs = {
+        "encoded_reference": str(encoded_reference_path),
+        "encoded_synthetic": str(encoded_synthetic_path),
+        "decoded_reference": str(decoded_reference_path),
+        "decoded_synthetic": str(decoded_synthetic_path),
+        "eval_encoder": str(eval_encoder_path),
+        "metrics_path": str(metrics_path),
+        "base_name": base_name,
+    }
+
+    if not force and decoded_synthetic_path.exists():
+        print(f"Reusing existing evaluation-encoded data: {decoded_synthetic_path}")
+        return outputs
+
+    encoding_config = load_encoding_config(encoding_config_path)
+
+    print(f"Loading reference data: {reference_file}")
+    reference_data = load_csv_with_metadata(reference_file, metadata_file)
+    print(f"  Reference shape: {reference_data.shape}")
+
+    print(f"Loading synthetic decoded data: {synthetic_decoded_path}")
+    synthetic_data = load_csv_with_metadata(synthetic_decoded_path, metadata_file)
+    print(f"  Synthetic shape: {synthetic_data.shape}")
+
+    print("Fitting evaluation encoder on reference data ...")
+    encoder = RDTDatasetEncoder(encoding_config)
+    encoder.fit(reference_data)
+
+    encoded_reference = encoder.transform(reference_data)
+    encoded_synthetic = encoder.transform(synthetic_data)
+    decoded_reference = encoder.reverse_transform(encoded_reference)
+    decoded_synthetic = encoder.reverse_transform(encoded_synthetic)
+
+    print(f"Encoded reference: {encoded_reference.shape}")
+    print(f"Encoded synthetic: {encoded_synthetic.shape}")
+
+    encoded_reference.to_csv(encoded_reference_path, index=False)
+    encoded_synthetic.to_csv(encoded_synthetic_path, index=False)
+    decoded_reference.to_csv(decoded_reference_path, index=False)
+    decoded_synthetic.to_csv(decoded_synthetic_path, index=False)
+    encoder.save(eval_encoder_path)
+
+    print(f"Saved encoded reference  → {encoded_reference_path}")
+    print(f"Saved encoded synthetic  → {encoded_synthetic_path}")
+    print(f"Saved decoded reference  → {decoded_reference_path}")
+    print(f"Saved decoded synthetic  → {decoded_synthetic_path}")
+    print(f"Saved eval encoder       → {eval_encoder_path}")
+
+    elapsed = round(time.time() - start_time, 2)
+    metrics = {
+        "encoding_type": "evaluation",
+        "encoding_version": "2.0",
+        "timestamp": datetime.now().isoformat(),
+        "base_name": base_name,
+        "fitted_on": "reference_data",
+        "input_shapes": {
+            "reference": list(reference_data.shape),
+            "synthetic": list(synthetic_data.shape),
+        },
+        "output_shapes": {
+            "encoded_reference": list(encoded_reference.shape),
+            "encoded_synthetic": list(encoded_synthetic.shape),
+            "decoded_reference": list(decoded_reference.shape),
+            "decoded_synthetic": list(decoded_synthetic.shape),
+        },
+        "transformers": {
+            col: type(trans).__name__ for col, trans in encoder.transformers.items()
+        },
+        "encoding_time_seconds": elapsed,
+        "outputs": {
+            "encoded_reference": str(encoded_reference_path),
+            "encoded_synthetic": str(encoded_synthetic_path),
+            "decoded_reference": str(decoded_reference_path),
+            "decoded_synthetic": str(decoded_synthetic_path),
+            "evaluation_encoder": str(eval_encoder_path),
+        },
+    }
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Saved metrics → {metrics_path}")
+    print(f"encode_evaluation done in {elapsed}s")
+
+    return outputs
+
+
+# ---------------------------------------------------------------------------
+# Flow — encode → train → generate → evaluation-encode
 # ---------------------------------------------------------------------------
 
 @flow(name="sdg-pipeline")
@@ -538,11 +676,22 @@ def sdg_pipeline(
         force_generate=force_generate,
     )
 
+    eval_encode_out = encode_evaluation(
+        reference_file=reference_file,
+        metadata_file=metadata_file,
+        encoding_config_file=encoding_config_file,
+        synthetic_decoded_path=generate_out["decoded_path"],
+        base_name=base_name,
+        output_dir=output_dir,
+        force=force_generate,
+    )
+
     return {
         "fit_encoder": fit_out,
         "encode_data": encode_out,
         "train_sdg": train_out,
         "generate_synthetic": generate_out,
+        "encode_evaluation": eval_encode_out,
     }
 
 
