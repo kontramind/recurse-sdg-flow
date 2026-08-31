@@ -43,6 +43,14 @@ from prefect import flow, task
 
 from sdg_core.encoding import RDTDatasetEncoder, load_encoding_config
 from sdg_core.generation import apply_post_processing
+from sdg_core.hallucination import (
+    bin_dataframe,
+    compute_bin_boundaries,
+    compute_hallucination_metrics,
+    compute_record_hashes,
+    get_column_types,
+    get_unique_hashes,
+)
 from sdg_core.hashing import calculate_file_hash
 from sdg_core.metadata import load_csv_with_metadata
 from sdg_core.serialization import create_model_metadata, load_model, save_model
@@ -581,8 +589,132 @@ def encode_evaluation(
     return outputs
 
 
+@task(name="hallucination-evaluation", log_prints=True)
+def hallucination_evaluation(
+    population_file: str,
+    training_file: str,
+    synthetic_decoded_path: str,
+    metadata_file: str,
+    base_name: str,
+    output_dir: str,
+    num_bins: int = 20,
+    force: bool = False,
+) -> dict:
+    """
+    Hallucination metrics (TotalFR / NovelFR / MemorizedFR / HR) via the
+    SQL-free binning + hashing approach: bin numerical columns against
+    population-derived boundaries, hash each row, do set-membership checks
+    against population and training. No DuckDB, no query file.
+
+    Consumes the evaluation-encoded *decoded* synthetic (encode_evaluation's
+    output), matching sdpype. Ported from sdpype flows/sdg_flow.py::
+    hallucination_evaluation — flat args instead of a cfg dict, sd-lake
+    metrics/ layout, base_name in place of experiment_name/seed/config_hash.
+    """
+    population_file = Path(population_file)
+    training_file = Path(training_file)
+    synthetic_decoded_path = Path(synthetic_decoded_path)
+    metadata_file = Path(metadata_file)
+
+    for p in (population_file, training_file, synthetic_decoded_path, metadata_file):
+        if not p.exists():
+            raise FileNotFoundError(f"Required file not found: {p}")
+
+    metrics_dir = Path(output_dir) / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"hallucination_{base_name}.json"
+    report_path = metrics_dir / f"hallucination_report_{base_name}.txt"
+
+    result = {"metrics_path": str(metrics_path), "report_path": str(report_path)}
+    if not force and metrics_path.exists():
+        print(f"Reusing existing hallucination metrics: {metrics_path}")
+        return result
+
+    start_time = time.time()
+    print(f"Loading population : {population_file}")
+    population_df = load_csv_with_metadata(population_file, metadata_file, low_memory=False)
+    print(f"Loading training   : {training_file}")
+    training_df = load_csv_with_metadata(training_file, metadata_file, low_memory=False)
+    print(f"Loading synthetic  : {synthetic_decoded_path}")
+    synthetic_df = load_csv_with_metadata(synthetic_decoded_path, metadata_file, low_memory=False)
+    print(f"  population {population_df.shape}, training {training_df.shape}, synthetic {synthetic_df.shape}")
+
+    print(f"Computing bin boundaries from population (num_bins={num_bins}) ...")
+    column_types = get_column_types(metadata_file)
+    boundaries = compute_bin_boundaries(population_df, column_types, num_bins)
+    print(f"  Boundaries for {len(boundaries)} numerical columns")
+
+    print("Binning datasets ...")
+    binned_population = bin_dataframe(population_df, column_types, boundaries, num_bins)
+    binned_training = bin_dataframe(training_df, column_types, boundaries, num_bins)
+    binned_synthetic = bin_dataframe(synthetic_df, column_types, boundaries, num_bins)
+
+    print("Hashing and computing metrics ...")
+    population_hashes = compute_record_hashes(binned_population)
+    training_hashes = compute_record_hashes(binned_training)
+    synthetic_hashes = compute_record_hashes(binned_synthetic)
+
+    population_unique = get_unique_hashes(population_hashes)
+    training_unique = get_unique_hashes(training_hashes)
+    print(f"  Population unique: {len(population_unique):,}  Training unique: {len(training_unique):,}")
+
+    metrics, _, _ = compute_hallucination_metrics(
+        population_unique, training_unique, synthetic_hashes
+    )
+
+    m = metrics
+    print(f"  TotalFR    : {m['TotalFR']['rate_pct']:.2f}%")
+    print(f"  NovelFR    : {m['NovelFR']['rate_pct']:.2f}%")
+    print(f"  MemorizedFR: {m['MemorizedFR']['rate_pct']:.2f}%")
+    print(f"  HR         : {m['HR']['rate_pct']:.2f}%")
+
+    results = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "base_name": base_name,
+            "population_file": str(population_file),
+            "training_file": str(training_file),
+            "synthetic_file": str(synthetic_decoded_path),
+            "num_bins": num_bins,
+        },
+        "dataset_statistics": {
+            "population": {"rows": population_df.shape[0], "columns": population_df.shape[1]},
+            "training": {"rows": training_df.shape[0], "columns": training_df.shape[1]},
+            "synthetic": {"rows": synthetic_df.shape[0], "columns": synthetic_df.shape[1]},
+        },
+        "binning": {
+            "num_bins": num_bins,
+            "boundaries_source": "population",
+            "numerical_columns": list(boundaries.keys()),
+        },
+        "metrics": metrics,
+        "execution_time": time.time() - start_time,
+    }
+
+    with open(metrics_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    report_lines = [
+        "Hallucination Evaluation Report",
+        "=" * 40,
+        f"Base name : {base_name}",
+        f"Num bins  : {num_bins}",
+        "",
+        f"TotalFR     (in population)            : {m['TotalFR']['rate_pct']:.2f}%  ({m['TotalFR']['count']:,} records)",
+        f"NovelFR     (in population, not in trn): {m['NovelFR']['rate_pct']:.2f}%  ({m['NovelFR']['count']:,} records)",
+        f"MemorizedFR (in population and in trn) : {m['MemorizedFR']['rate_pct']:.2f}%  ({m['MemorizedFR']['count']:,} records)",
+        f"HR          (not in population)        : {m['HR']['rate_pct']:.2f}%  ({m['HR']['count']:,} records)",
+        f"Total                                  : {m['total_records']:,} records",
+    ]
+    report_path.write_text("\n".join(report_lines))
+
+    print(f"Saved hallucination metrics → {metrics_path}")
+    print(f"Saved hallucination report  → {report_path}")
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Flow — encode → train → generate → evaluation-encode
+# Flow — encode → train → generate → evaluation-encode → hallucination
 # ---------------------------------------------------------------------------
 
 @flow(name="sdg-pipeline")
@@ -602,6 +734,7 @@ def sdg_pipeline(
     distance_metric: str = "hamming",
     fallback: str = "weighted",
     force_generate: bool = False,
+    hallucination_num_bins: int = 20,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
@@ -686,12 +819,24 @@ def sdg_pipeline(
         force=force_generate,
     )
 
+    halluc_out = hallucination_evaluation(
+        population_file=population_file,
+        training_file=training_file,
+        synthetic_decoded_path=eval_encode_out["decoded_synthetic"],
+        metadata_file=metadata_file,
+        base_name=base_name,
+        output_dir=output_dir,
+        num_bins=hallucination_num_bins,
+        force=force_generate,
+    )
+
     return {
         "fit_encoder": fit_out,
         "encode_data": encode_out,
         "train_sdg": train_out,
         "generate_synthetic": generate_out,
         "encode_evaluation": eval_encode_out,
+        "hallucination": halluc_out,
     }
 
 
@@ -724,6 +869,7 @@ _DEFAULTS = {
     "distance_metric": "hamming",
     "fallback": "weighted",
     "force_generate": False,
+    "hallucination_num_bins": 20,
     "encoder_dir": "outputs/sdg_runs/encoders",
     "output_dir": "outputs/sdg_runs",
 }
@@ -745,7 +891,7 @@ def _resolve(cli_value, config: dict, key: str, default=None):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the SDG pipeline (fit_encoder + encode_data + train_sdg + generate_synthetic)",
+        description="Run the SDG pipeline (encode -> train -> generate -> encode_evaluation -> hallucination)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="Optional path to a plain YAML config file; CLI flags below override it")
@@ -764,6 +910,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--distance-metric", default=None, help="Distance metric for the 'knn' post-process method")
     parser.add_argument("--fallback", default=None, choices=sorted(VALID_FALLBACKS), help="Fallback method when a column is 100% invalid")
     parser.add_argument("--force-generate", action="store_true", default=None, help="Regenerate synthetic data even if cached output exists")
+    parser.add_argument("--hallucination-num-bins", type=int, default=None, help="Bins for the hallucination metric's numerical quantisation (or evaluation.hallucination.num_bins in --config)")
     parser.add_argument("--encoder-dir", default=None, help="Shared population-encoder cache dir")
     parser.add_argument("--output-dir", default=None, help="Per-run output directory")
     return parser.parse_args()
@@ -789,6 +936,17 @@ if __name__ == "__main__":
     force_generate = _resolve(args.force_generate, config, "force_generate", _DEFAULTS["force_generate"])
     encoder_dir = _resolve(args.encoder_dir, config, "encoder_dir", _DEFAULTS["encoder_dir"])
     output_dir = _resolve(args.output_dir, config, "output_dir", _DEFAULTS["output_dir"])
+
+    # Evaluation-stage settings live under a nested "evaluation" block in
+    # --config (mirroring sdpype's params.yaml), so they need direct access
+    # rather than the flat _resolve() helper. A CLI flag still wins.
+    _eval_cfg = config.get("evaluation", {}) or {}
+    if args.hallucination_num_bins is not None:
+        hallucination_num_bins = args.hallucination_num_bins
+    else:
+        hallucination_num_bins = (_eval_cfg.get("hallucination", {}) or {}).get(
+            "num_bins", _DEFAULTS["hallucination_num_bins"]
+        )
 
     # --params is a JSON string on the CLI, but config's "params" key is
     # already a native mapping (YAML parses nested dicts directly).
@@ -833,6 +991,7 @@ if __name__ == "__main__":
         distance_metric=distance_metric,
         fallback=fallback,
         force_generate=bool(force_generate),
+        hallucination_num_bins=hallucination_num_bins,
         encoder_dir=encoder_dir,
         output_dir=output_dir,
     )
