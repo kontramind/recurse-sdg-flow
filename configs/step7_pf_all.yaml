@@ -23,13 +23,13 @@ sdg:
   parameters: {}              # inline hyperparameter overrides (default: model defaults)
 
 data:
-  training_file:   ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
-  reference_file:  ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
-  population_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_population.csv
-  metadata_file:   ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_metadata.json
+  training_file:   ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
+  reference_file:  ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
+  population_file: ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_population.csv
+  metadata_file:   ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_metadata.json
 
 encoding:
-  config_file:     ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_encoding.yaml
+  config_file:     ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_encoding.yaml
 
 generation:
   n_samples:                  # null -> auto-size from reference_file

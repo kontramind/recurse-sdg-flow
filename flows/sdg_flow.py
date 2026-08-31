@@ -1146,18 +1146,20 @@ def statistical_similarity(
 # Flow — encode → train → generate → evaluation-encode → hallucination → TSTR → privacy → detection
 # ---------------------------------------------------------------------------
 
-def _run_name(tag: str, training_file: str, library: str, model_type: str, seed: int) -> str:
-    """Assemble the sd-lake run-directory name.
+def _run_name(training_file: str, library: str, model_type: str, seed: int,
+              tag: Optional[str] = None) -> str:
+    """Assemble the run-directory name.
 
     sd-lake nests each run as
         <lake>/<experiment>/<model_type>/<tag>_<dseed>_<library>_<model>_mseed<seed>/
     e.g. Step7pfp_dseed1597_synthcity_arf_mseed987 — where <dseed> is the
-    dseedNNN token from the training-file path. Falls back to the training
-    stem when no dseed token is present.
+    dseedNNN token from the training-file path (falls back to the training
+    stem when absent). Without a tag the leading segment is dropped.
     """
     m = re.search(r"dseed\d+", Path(training_file).stem)
     dseed = m.group(0) if m else Path(training_file).stem
-    return f"{tag}_{dseed}_{library}_{model_type}_mseed{seed}"
+    stem = f"{dseed}_{library}_{model_type}_mseed{seed}"
+    return f"{tag}_{stem}" if tag else stem
 
 
 @flow(name="sdg-pipeline")
@@ -1216,15 +1218,14 @@ def sdg_pipeline(
             {"name": "category_adherence", "parameters": {"target_columns": None}},
         ]
 
-    # Run-directory wrapper. When experiment_tag (or an explicit run_name) is
-    # given, nest all artefacts under output_dir/<run_name>/ so the tree maps
-    # 1:1 onto a sd-lake run dir (data/ models/ metrics/ under a
-    # <tag>_<dseed>_<library>_<model>_mseed<seed> folder). Without either, the
-    # old flat behaviour is kept — output_dir is the run dir.
-    if run_name is None and experiment_tag:
-        run_name = _run_name(experiment_tag, training_file, library, model_type, seed)
-    if run_name:
-        output_dir = str(Path(output_dir) / run_name)
+    # Run-directory wrapper: every run nests under output_dir/<run_name>/ so
+    # the tree maps 1:1 onto a sd-lake run dir (data/ models/ metrics/ under a
+    # <tag>_<dseed>_<library>_<model>_mseed<seed> folder). run_name is taken
+    # verbatim when given, else assembled from experiment_tag (+ the data
+    # identifiers).
+    if run_name is None:
+        run_name = _run_name(training_file, library, model_type, seed, tag=experiment_tag)
+    output_dir = str(Path(output_dir) / run_name)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {output_dir}")
 
@@ -1471,8 +1472,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hallucination-num-bins", type=int, default=None, help="Bins for the hallucination metric's numerical quantisation (or evaluation.hallucination.num_bins in --config)")
     parser.add_argument("--privacy-qi-columns", default=None, help="Comma-separated quasi-identifier columns for k-anonymity (or evaluation.privacy.metrics[0].parameters.qi_columns in --config; default: pf_all set)")
     parser.add_argument("--encoder-dir", default=None, help="Shared population-encoder cache dir")
-    parser.add_argument("--output-dir", default=None, help="Root output directory; runs nest under it as <run-name>/ when a run name is resolvable (see --run-name / experiment.tag)")
-    parser.add_argument("--run-name", default=None, help="Explicit run-directory name under --output-dir (default: <tag>_<dseed>_<library>_<model>_mseed<seed> when experiment.tag is set, else flat in --output-dir)")
+    parser.add_argument("--output-dir", default=None, help="Root output directory; every run nests under it as <run-name>/")
+    parser.add_argument("--run-name", default=None, help="Run-directory name under --output-dir (default: <tag>_<dseed>_<library>_<model>_mseed<seed>, or the same without the <tag> segment when experiment.tag is unset)")
     return parser.parse_args()
 
 

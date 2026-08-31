@@ -169,14 +169,14 @@ The `evaluation.statistical_similarity` / `detection_evaluation` blocks
 CLI-flag shape and are read straight from the config, with the Step7 values
 as built-in defaults.
 
-When `experiment.tag` is set (or `--run-name` is given), everything nests
-under `--output-dir/<run-name>/` in the same per-run tree layout the
-production data lake (`sd-lake/<experiment>/<model>/<run>/`) uses — so port
-output maps directly onto a real run folder for comparison. The run name is
-`<tag>_<dseed>_<library>_<model>_mseed<seed>` (e.g.
+Every run nests under `--output-dir/<run-name>/` in the same per-run tree
+layout the production data lake (`sd-lake/<experiment>/<model>/<run>/`)
+uses — so port output maps directly onto a real run folder for comparison.
+The run name is `<tag>_<dseed>_<library>_<model>_mseed<seed>` (e.g.
 `Step7pfp_dseed1597_synthcity_arf_mseed987`), matching sd-lake's run-dir
-convention; `<dseed>` is the `dseedNNN` token from the training-file path.
-Without a tag / `--run-name`, `--output-dir` itself is the run dir (flat).
+convention; `<dseed>` is the `dseedNNN` token from the training-file path,
+`<tag>` comes from `experiment.tag` (dropped from the name when unset).
+`--run-name` overrides the assembled name.
 
 ```
 <run-name>/
