@@ -54,6 +54,19 @@ dependencies = [
     # reports.single_table._properties API (SpearmanColumnPairTrends), so pin
     # it directly to sdpype's version.
     "sdmetrics==0.28.0",
+    # Step 5 — statistical_similarity stage. Two eval-only backends used by
+    # sdpype/evaluation/statistical.py:
+    #   syndat   -> jensenshannon_syndat  (syndat.metrics.jensen_shannon_distance)
+    #   geomloss -> wasserstein_distance  (geomloss.SamplesLoss, Sinkhorn OT)
+    # geomloss is already pulled transitively by synthcity but resolves 0.3.1
+    # here vs sdpype's 0.2.6 — pin it back. syndat is new; it drags a plotting/
+    # explainability tail (matplotlib/seaborn/plotnine/shap) that is off the
+    # JSD compute path. nannyml is deliberately NOT added: JensenShannonNannyMLMetric
+    # is np.histogram + scipy.spatial.distance.jensenshannon only despite its
+    # name, and the module-level `from nannyml...` import is dead code (dropped
+    # in the port).
+    "syndat==0.13.6",
+    "geomloss==0.2.6",
 ]
 
 [build-system]
