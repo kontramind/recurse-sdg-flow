@@ -13,10 +13,9 @@ generate_synthetic. Everything from sdg_flow.py's own "# Evaluation tasks"
 marker onward (statistical/privacy/detection/hallucination/TSTR + report) is
 a separate, later step — not ported here.
 
-This checkpoint wires only fit_encoder + encode_data (the deterministic
-encode stage) so it can be verified byte-exact against real production
-output before train_sdg/generate_synthetic (which involve stochastic model
-training) are added.
+This checkpoint adds train_sdg (arf/ctgan/ddpm/rtvae/nflow, synthcity-only)
+on top of the already-verified fit_encoder + encode_data. generate_synthetic
+is not wired yet.
 
 Usage:
     python flows/sdg_flow.py \\
@@ -24,7 +23,7 @@ Usage:
         --population-file path/to/..._population.csv \\
         --metadata-file   path/to/..._metadata.json \\
         --encoding-config path/to/..._encoding.yaml \\
-        --seed 28657
+        --model-type arf --seed 28657
 """
 
 import argparse
@@ -34,11 +33,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 from prefect import flow, task
 
 from sdg_core.encoding import RDTDatasetEncoder, load_encoding_config
 from sdg_core.hashing import calculate_file_hash
 from sdg_core.metadata import load_csv_with_metadata
+from sdg_core.serialization import create_model_metadata, save_model
+from sdg_core.training import create_experiment_hash, create_synthcity_model
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +196,106 @@ def encode_data(
     }
 
 
+@task(name="train-sdg", log_prints=True)
+def train_sdg(
+    encoded_training_path: str,
+    training_file: str,
+    model_type: str,
+    library: str,
+    seed: int,
+    parameters: dict,
+    run_params: dict,
+    base_name: str,
+    output_dir: str,
+) -> dict:
+    """
+    Train a synthcity SDG model on the encoded training data.
+
+    Only library="synthcity" is implemented (this repo's locked scope —
+    see the port plan). `library` is still a real parameter, not hardcoded,
+    so adding another library later is a contained change.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = output_dir / f"sdg_model_{base_name}.pkl"
+    metrics_path = output_dir / f"metrics_training_{base_name}.json"
+
+    if model_path.exists():
+        print(f"Reusing existing SDG model: {model_path}")
+        return {
+            "model_path": str(model_path),
+            "metrics_path": str(metrics_path),
+            "base_name": base_name,
+            "library": library,
+            "model_type": model_type,
+        }
+
+    print(f"Library    : {library}")
+    print(f"Model type : {model_type}")
+    print(f"Seed       : {seed}")
+
+    if library != "synthcity":
+        raise ValueError(f"Unsupported library: {library!r} (only 'synthcity' is implemented)")
+
+    training_data = pd.read_csv(encoded_training_path)
+    print(f"Training data (encoded): {training_data.shape}")
+    model = create_synthcity_model(model_type, parameters, seed)
+
+    print(f"Training {library} {model_type} ...")
+    start_time = time.time()
+    model.fit(training_data)
+    training_time = round(time.time() - start_time, 2)
+    print(f"Training completed in {training_time}s")
+
+    sdg_params = {"library": library, "model_type": model_type, "parameters": parameters}
+    experiment_hash = create_experiment_hash(sdg_params, seed, training_file)
+    experiment_id = f"{model_type}_{seed}_{experiment_hash}"
+
+    model_metadata = create_model_metadata(
+        model_type=model_type,
+        library=library,
+        seed=seed,
+        training_time=training_time,
+        data=training_data,
+        experiment_id=experiment_id,
+        experiment_hash=experiment_hash,
+        parameters=parameters,
+        run_params=run_params,
+    )
+    saved_model_path = save_model(model, model_metadata, library, model_path)
+    print(f"Saved model → {saved_model_path}")
+
+    metrics = {
+        "experiment_id": experiment_id,
+        "experiment_hash": experiment_hash,
+        "seed": seed,
+        "library": library,
+        "model_type": model_type,
+        "training_time": training_time,
+        "training_rows": len(training_data),
+        "training_columns": len(training_data.columns),
+        "timestamp": datetime.now().isoformat(),
+        "data_source": str(encoded_training_path),
+        "model_output": saved_model_path,
+        "model_parameters": parameters or {},
+    }
+
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Saved metrics → {metrics_path}")
+
+    return {
+        "model_path": saved_model_path,
+        "metrics_path": str(metrics_path),
+        "base_name": base_name,
+        "library": library,
+        "model_type": model_type,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Flow (encode-only checkpoint — train_sdg/generate_synthetic added next)
+# Flow (encode + train checkpoint — generate_synthetic added next)
 # ---------------------------------------------------------------------------
 
 @flow(name="sdg-pipeline")
@@ -204,10 +304,24 @@ def sdg_pipeline(
     population_file: str,
     metadata_file: str,
     encoding_config_file: str,
+    model_type: str,
+    library: str = "synthcity",
     seed: int = 42,
+    parameters: dict | None = None,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
+    run_params = {
+        "training_file": training_file,
+        "population_file": population_file,
+        "metadata_file": metadata_file,
+        "encoding_config_file": encoding_config_file,
+        "model_type": model_type,
+        "library": library,
+        "seed": seed,
+        "parameters": parameters,
+    }
+
     fit_out = fit_encoder(
         population_file=population_file,
         metadata_file=metadata_file,
@@ -215,7 +329,7 @@ def sdg_pipeline(
         encoder_dir=encoder_dir,
     )
 
-    base_name = f"{Path(training_file).stem}_{seed}"
+    base_name = f"{model_type}_{Path(training_file).stem}_{seed}"
     encode_out = encode_data(
         training_file=training_file,
         metadata_file=metadata_file,
@@ -224,7 +338,19 @@ def sdg_pipeline(
         output_dir=output_dir,
     )
 
-    return {"fit_encoder": fit_out, "encode_data": encode_out}
+    train_out = train_sdg(
+        encoded_training_path=encode_out["encoded_training"],
+        training_file=training_file,
+        model_type=model_type,
+        library=library,
+        seed=seed,
+        parameters=parameters,
+        run_params=run_params,
+        base_name=base_name,
+        output_dir=output_dir,
+    )
+
+    return {"fit_encoder": fit_out, "encode_data": encode_out, "train_sdg": train_out}
 
 
 # ---------------------------------------------------------------------------
@@ -233,14 +359,17 @@ def sdg_pipeline(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the SDG encode stage (fit_encoder + encode_data)",
+        description="Run the SDG pipeline (fit_encoder + encode_data + train_sdg)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--training-file", required=True, help="Path to training CSV")
     parser.add_argument("--population-file", required=True, help="Path to population CSV")
     parser.add_argument("--metadata-file", required=True, help="Path to metadata JSON")
     parser.add_argument("--encoding-config", required=True, help="Path to encoding YAML")
-    parser.add_argument("--seed", type=int, default=42, help="Model seed (used in output naming)")
+    parser.add_argument("--model-type", required=True, choices=["arf", "ctgan", "ddpm", "rtvae", "nflow"], help="Synthcity generator to train")
+    parser.add_argument("--library", default="synthcity", help="Generator library (only 'synthcity' is implemented; kept as a real seam for future libraries)")
+    parser.add_argument("--seed", type=int, default=42, help="Model seed")
+    parser.add_argument("--params", default="{}", help="Inline JSON string of model hyperparameter overrides")
     parser.add_argument("--encoder-dir", default="outputs/sdg_runs/encoders", help="Shared population-encoder cache dir")
     parser.add_argument("--output-dir", default="outputs/sdg_runs", help="Per-run output directory")
     return parser.parse_args()
@@ -248,13 +377,17 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
+    parameters = json.loads(args.params)
 
     sdg_pipeline(
         training_file=args.training_file,
         population_file=args.population_file,
         metadata_file=args.metadata_file,
         encoding_config_file=args.encoding_config,
+        model_type=args.model_type,
+        library=args.library,
         seed=args.seed,
+        parameters=parameters,
         encoder_dir=args.encoder_dir,
         output_dir=args.output_dir,
     )
