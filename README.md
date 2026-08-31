@@ -159,17 +159,25 @@ upcoming evaluation stages (statistical/privacy/detection metrics) have
 deeply nested per-metric configuration that only really works as a config
 file, not a wall of flags.
 
-This writes, under `--output-dir`:
+This writes, under `--output-dir`, in the same per-run tree layout the
+production data lake (`sd-lake/<run>/`) uses — so port output maps
+directly onto a real run folder for comparison:
 
 ```
-encoded_training_<base_name>.csv / decoded_training_<base_name>.csv     # dual-pipeline encode output
-training_encoder_<base_name>.pkl                                        # per-run copy of the population encoder
-sdg_model_<base_name>.pkl                                               # trained generator
-synthetic_<base_name>_encoded.csv / synthetic_<base_name>_decoded.csv   # generated synthetic data
-metrics_{encoding,training,generation}_<base_name>.json
+data/encoded/training_<base_name>.csv        # dual-pipeline encode output
+data/decoded/training_<base_name>.csv
+data/synthetic/synthetic_data_<base_name>_encoded.csv    # generated synthetic data
+data/synthetic/synthetic_data_<base_name>_decoded.csv
+models/training_encoder_<base_name>.pkl      # per-run copy of the population encoder
+models/sdg_model_<base_name>.pkl             # trained generator
+metrics/{encoding,training,generation}_<base_name>.json
 ```
 
-where `<base_name>` is `<model-type>_<training-file-stem>_<seed>`. The
+The only structural departure from `sd-lake` is `<base_name>` itself —
+`<model-type>_<training-file-stem>_<seed>` here, versus the Hydra
+`experiment_name` template (`synthcity_<model>_<3 data hashes>_gen_<N>_<tag>_<config
+hash>_<mseed>`) in production, which was dropped along with Hydra in the
+scaffolding step. File *contents* still match byte-for-byte. The
 population encoder itself is cached separately under `--encoder-dir`
 (default `outputs/sdg_runs/encoders/`), keyed by a hash of the population
 file's content — fit once per population file and reused across every

@@ -135,7 +135,12 @@ def encode_data(
             raise FileNotFoundError(f"Required file not found: {p}")
 
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    encoded_dir = output_dir / "data" / "encoded"
+    decoded_dir = output_dir / "data" / "decoded"
+    models_dir = output_dir / "models"
+    metrics_dir = output_dir / "metrics"
+    for d in (encoded_dir, decoded_dir, models_dir, metrics_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading encoder: {encoder_path}")
     encoder = RDTDatasetEncoder.load(encoder_path)
@@ -150,10 +155,10 @@ def encode_data(
 
     decoded_training = encoder.reverse_transform(encoded_training)
 
-    encoded_path = output_dir / f"encoded_training_{base_name}.csv"
-    decoded_path = output_dir / f"decoded_training_{base_name}.csv"
+    encoded_path = encoded_dir / f"training_{base_name}.csv"
+    decoded_path = decoded_dir / f"training_{base_name}.csv"
     # Copy encoder to a per-run path (mirrors production's per-experiment copy)
-    exp_encoder_path = output_dir / f"training_encoder_{base_name}.pkl"
+    exp_encoder_path = models_dir / f"training_encoder_{base_name}.pkl"
 
     encoded_training.to_csv(encoded_path, index=False)
     decoded_training.to_csv(decoded_path, index=False)
@@ -187,7 +192,7 @@ def encode_data(
         },
     }
 
-    metrics_path = output_dir / f"metrics_encoding_{base_name}.json"
+    metrics_path = metrics_dir / f"encoding_{base_name}.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
     print(f"Saved metrics → {metrics_path}")
@@ -222,10 +227,13 @@ def train_sdg(
     so adding another library later is a contained change.
     """
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    models_dir = output_dir / "models"
+    metrics_dir = output_dir / "metrics"
+    for d in (models_dir, metrics_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    model_path = output_dir / f"sdg_model_{base_name}.pkl"
-    metrics_path = output_dir / f"metrics_training_{base_name}.json"
+    model_path = models_dir / f"sdg_model_{base_name}.pkl"
+    metrics_path = metrics_dir / f"training_{base_name}.json"
 
     if model_path.exists():
         print(f"Reusing existing SDG model: {model_path}")
@@ -328,11 +336,14 @@ def generate_synthetic(
     implemented (this repo's locked scope).
     """
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    synthetic_dir = output_dir / "data" / "synthetic"
+    metrics_dir = output_dir / "metrics"
+    for d in (synthetic_dir, metrics_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    encoded_path = output_dir / f"synthetic_{base_name}_encoded.csv"
-    decoded_path = output_dir / f"synthetic_{base_name}_decoded.csv"
-    metrics_path = output_dir / f"metrics_generation_{base_name}.json"
+    encoded_path = synthetic_dir / f"synthetic_data_{base_name}_encoded.csv"
+    decoded_path = synthetic_dir / f"synthetic_data_{base_name}_decoded.csv"
+    metrics_path = metrics_dir / f"generation_{base_name}.json"
 
     if not force_generate and decoded_path.exists():
         print(f"Reusing existing synthetic data: {decoded_path}")
