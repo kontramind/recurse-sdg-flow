@@ -1,0 +1,120 @@
+# Step7 pf_all — population_fixed, all 23 features (snake_case).
+#
+# Mirrors sdpype's params_step7_pf_all.yaml. Consumed by flows/sdg_flow.py
+# via `--config configs/step7_pf_all.yaml`; every CLI flag overrides the
+# matching key here (CLI > this file > built-in default). Plain
+# yaml.safe_load — no Hydra interpolation, config groups, or `${...}`
+# templating (that machinery was dropped in the scaffolding step). The
+# Hydra-only `experiment.name` / `tags` templates are omitted for the same
+# reason. `tag` is kept (plain scalar, not a template): it names the run
+# directory, sd-lake-style — <tag>_<dseed>_<library>_<model>_mseed<seed>.
+
+experiment:
+  # Model seed. Production sweeps this per run (the mseed in the sd-lake
+  # folder name, e.g. mseed28657); 987 is the config default. Override
+  # with --seed.
+  seed: 987
+  generation: 0
+  tag: Step7pfa
+
+sdg:
+  library: synthcity          # only 'synthcity' is implemented
+  model_type: arf             # arf | ctgan | ddpm | rtvae | nflow
+  parameters: {}              # inline hyperparameter overrides (default: model defaults)
+
+data:
+  training_file:   ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
+  reference_file:  ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
+  population_file: ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_population.csv
+  metadata_file:   ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_metadata.json
+
+encoding:
+  config_file:     ../rd-lake-verif/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_encoding.yaml
+
+generation:
+  n_samples:                  # null -> auto-size from reference_file
+
+post_processing:
+  fix_invalid_categories:
+    enabled: true             # false -> method "none"
+    method: knn               # knn | weighted | random | none
+    knn_neighbors: 5
+    distance_metric: hamming
+    fallback: weighted
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+evaluation:
+  statistical_similarity:
+    metrics:
+    - name: table_structure
+      parameters: {}
+    - name: semantic_structure
+      parameters: {}
+    - name: boundary_adherence
+      parameters:
+        target_columns:
+    - name: category_adherence
+      parameters:
+        target_columns:
+    - name: alpha_precision
+      parameters: {}
+    - name: prdc_score
+      parameters:
+        nearest_k: 5
+    - name: wasserstein_distance
+      parameters: {}
+    - name: maximum_mean_discrepancy
+      parameters:
+        kernel: rbf
+        # Corrected MMD (not synthcity's degenerate gamma=1.0). Frozen
+        # per-variant RBF gamma from sdpype's mmd_recompute_manifest_corrected
+        # .json — median heuristic on the z-scored real reference, pooled over
+        # Step7pfa's dseeds. Diverges from params_step7_pf_all.yaml on purpose.
+        gamma: 0.02524003218131145
+    - name: new_row_synthesis
+      parameters:
+        numerical_match_tolerance: 0.01
+        synthetic_sample_size:
+    - name: jensenshannon_synthcity
+      parameters:
+        normalize: true
+        n_histogram_bins: 10
+    - name: jensenshannon_syndat
+      parameters:
+        n_unique_threshold: 10
+    - name: jensenshannon_nannyml
+      parameters: {}
+    - name: ks_complement
+      parameters:
+        target_columns:
+    - name: tv_complement
+      parameters:
+        target_columns:
+    - name: sdmetrics_quality
+      max_display_cols: 20
+
+  detection_evaluation:
+    common_params:
+      n_folds: 5
+      random_state: 987
+      reduction: max
+    methods:
+    - name: detection_gmm
+      parameters: {}
+    - name: detection_xgb
+      parameters: {}
+    - name: detection_mlp
+      parameters: {}
+    - name: detection_linear
+      parameters: {}
+
+  privacy:
+    metrics:
+    - name: k_anonymization
+      parameters:
+        qi_columns: [age, gender, ethnicity, admission_type]
+
+  hallucination:
+    num_bins: 20

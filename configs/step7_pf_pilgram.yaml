@@ -1,0 +1,113 @@
+# Step7 pf_pilgram — population_fixed, 13-column pilgram clinical core.
+#
+# Mirrors sdpype's params_step7_pf_pilgram.yaml. Identical to
+# step7_pf_all.yaml except the data/encoding paths and the k-anonymity
+# quasi-identifier set (no "gender" column in this revision). See that file
+# for how --config resolution works.
+
+experiment:
+  seed: 987
+  generation: 0
+  tag: Step7pfp
+
+sdg:
+  library: synthcity
+  model_type: arf
+  parameters: {}
+
+data:
+  training_file:   ../rd-lake-verif/Step7/dseed1597_rev_pf_pilgram/data_sample10000_dseed1597_rev_pf_pilgram_training.csv
+  reference_file:  ../rd-lake-verif/Step7/dseed1597_rev_pf_pilgram/data_sample10000_dseed1597_rev_pf_pilgram_training.csv
+  population_file: ../rd-lake-verif/Step7/dseed1597_rev_pf_pilgram/data_sample10000_dseed1597_rev_pf_pilgram_population.csv
+  metadata_file:   ../rd-lake-verif/Step7/dseed1597_rev_pf_pilgram/data_sample10000_dseed1597_rev_pf_pilgram_metadata.json
+
+encoding:
+  config_file:     ../rd-lake-verif/Step7/dseed1597_rev_pf_pilgram/data_sample10000_dseed1597_rev_pf_pilgram_encoding.yaml
+
+generation:
+  n_samples:
+
+post_processing:
+  fix_invalid_categories:
+    enabled: true
+    method: knn
+    knn_neighbors: 5
+    distance_metric: hamming
+    fallback: weighted
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+evaluation:
+  statistical_similarity:
+    metrics:
+    - name: table_structure
+      parameters: {}
+    - name: semantic_structure
+      parameters: {}
+    - name: boundary_adherence
+      parameters:
+        target_columns:
+    - name: category_adherence
+      parameters:
+        target_columns:
+    - name: alpha_precision
+      parameters: {}
+    - name: prdc_score
+      parameters:
+        nearest_k: 5
+    - name: wasserstein_distance
+      parameters: {}
+    - name: maximum_mean_discrepancy
+      parameters:
+        kernel: rbf
+        # Corrected MMD (not synthcity's degenerate gamma=1.0). Frozen
+        # per-variant RBF gamma from sdpype's mmd_recompute_manifest_corrected
+        # .json — median heuristic on the z-scored real reference, pooled over
+        # Step7pfp's dseeds. Diverges from params_step7_pf_pilgram.yaml on purpose.
+        gamma: 0.048527854564490464
+    - name: new_row_synthesis
+      parameters:
+        numerical_match_tolerance: 0.01
+        synthetic_sample_size:
+    - name: jensenshannon_synthcity
+      parameters:
+        normalize: true
+        n_histogram_bins: 10
+    - name: jensenshannon_syndat
+      parameters:
+        n_unique_threshold: 10
+    - name: jensenshannon_nannyml
+      parameters: {}
+    - name: ks_complement
+      parameters:
+        target_columns:
+    - name: tv_complement
+      parameters:
+        target_columns:
+    - name: sdmetrics_quality
+      max_display_cols: 20
+
+  detection_evaluation:
+    common_params:
+      n_folds: 5
+      random_state: 987
+      reduction: max
+    methods:
+    - name: detection_gmm
+      parameters: {}
+    - name: detection_xgb
+      parameters: {}
+    - name: detection_mlp
+      parameters: {}
+    - name: detection_linear
+      parameters: {}
+
+  privacy:
+    metrics:
+    - name: k_anonymization
+      parameters:
+        qi_columns: [age, ethnicity, admission_type]
+
+  hallucination:
+    num_bins: 20

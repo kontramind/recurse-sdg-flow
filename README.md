@@ -11,8 +11,12 @@ TBD]. It is being assembled incrementally:
 3. ✅ TRTR baseline (`flows/lgbm_cv_flow.py`) — LightGBM + Optuna HPO on real
    data, the reference point TSTR is later measured against
 4. ✅ Minimal Prefect pipeline (`flows/sdg_flow.py`): encode → train → generate
-5. ⏳ Recursive multi-generation loop
-6. ⏳ Evaluation stages (statistical, privacy, detection, hallucination, TSTR)
+5. ✅ Evaluation stages (`flows/sdg_flow.py`): encode-for-eval, statistical
+   similarity (15 sub-metrics), privacy (k-anonymity), detection (C2ST),
+   hallucination, TSTR — plus an end-of-run rich console report + timing
+   summary. Every metric verified against the production data lake's gen-0
+   artifacts (see *Reproducibility* below).
+6. ⏳ Recursive multi-generation loop
 
 ## Setup
 
@@ -80,8 +84,8 @@ uv run python3 flows/lgbm_cv_flow.py \
 This writes `lgbm_cv_<timestamp>.{json,md,pkl}` plus
 `shap_importance_<timestamp>.{csv,png}` into `--output-dir`, and — since
 `--test-dataset` was given — also copies the metrics JSON next to the test
-CSV in the dseed folder (matching the layout a later TSTR stage will expect
-to auto-discover it from). The JSON's `best_params` and decision `threshold`
+CSV in the dseed folder, where the SDG pipeline's TSTR stage auto-discovers
+it. The JSON's `best_params` and decision `threshold`
 are meant to be **frozen and reused** for every TSTR run on that dseed —
 don't re-tune per generation, or you'd conflate synthetic-data quality
 decline with the optimizer landing on different hyperparameters.
@@ -99,11 +103,38 @@ versions (see `pyproject.toml`'s exact pins).
 
 ### SDG pipeline (`flows/sdg_flow.py`)
 
-Trains one of five synthcity-backed generators on a dseed's data and samples
-synthetic data from it. Runs the same three stages the original DVC/Hydra
-pipeline did — fit an encoder on the population data, encode the training
-data, train, generate — now driven entirely by CLI flags instead of a
-`params.yaml`.
+Trains one of five synthcity-backed generators on a dseed's data, samples
+synthetic data from it, and runs the full evaluation suite: fit an encoder
+on the population data, encode the training data, train, generate, then
+encode-for-evaluation and compute
+
+- **statistical similarity** — all 15 sub-metrics (`table_structure`,
+  `semantic_structure`, `boundary_adherence`, `category_adherence`,
+  `alpha_precision`, `prdc_score`, `wasserstein_distance`,
+  `maximum_mean_discrepancy`, `new_row_synthesis`, `jensenshannon_synthcity`
+  / `_syndat` / `_nannyml`, `ks_complement`, `tv_complement`,
+  `sdmetrics_quality`)
+- **privacy** — k-anonymity over a quasi-identifier set
+- **detection** — synthcity real-vs-synthetic classifier two-sample test
+- **hallucination** — TotalFR / NovelFR / MemorizedFR / HR against the
+  population
+- **TSTR** — train LightGBM on synthetic, test on the real held-out set,
+  with the frozen TRTR params from step 3
+
+Each stage writes a `metrics/<stage>_<base_name>.json` (+ a `*_report.txt`),
+then a rich console report prints every stage as a table plus a per-stage
+timing summary (`--no-report` skips it). Same stages the original DVC/Hydra
+pipeline ran, now driven by a plain config file and/or CLI flags.
+
+```bash
+uv run python3 flows/sdg_flow.py --config configs/step7_pf_all.yaml
+# or point at the pf_pilgram revision, and override any key on the CLI:
+uv run python3 flows/sdg_flow.py --config configs/step7_pf_pilgram.yaml --model-type ddpm --seed 28657
+```
+
+`configs/step7_pf_{all,pilgram}.yaml` are committed and mirror sdpype's
+`params_step7_pf_{all,pilgram}.yaml`. Everything can also be given purely as
+flags, no config file:
 
 ```bash
 uv run python3 flows/sdg_flow.py \
@@ -132,44 +163,60 @@ every experiment folder in the production data lake), so they're out of
 scope here. `--library` is kept as a real argument rather than hardcoded,
 so adding another backend later is a contained change, not a rewrite.
 
-Every setting above can also come from an optional `--config path/to/file.yaml`
-instead of (or alongside) CLI flags — a CLI flag always wins when both are
-given. This is a plain `yaml.safe_load`, not Hydra: no interpolation,
-templating, or config-group composition, just a flat mapping of the same
-option names (underscored: `training_file`, `model_type`, `post_process_method`,
-etc.), e.g.:
+The `--config` file mirrors sdpype's `params_step7_*.yaml` nested layout —
+`experiment` / `sdg` / `data` / `encoding` / `generation` /
+`post_processing` / `evaluation` — so it maps 1:1 onto the original
+experiment configs. It is a plain `yaml.safe_load`: no Hydra interpolation,
+`${...}` templating, or config-group composition (the Hydra-only
+`experiment.name` / `tags` templates are omitted; `experiment.tag` is kept
+— it names the run directory, see below). A CLI flag always wins over the
+file. CLI-flag ↔ config-key mapping:
 
-```yaml
-training_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
-population_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_population.csv
-metadata_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_metadata.json
-encoding_config: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_encoding.yaml
-model_type: arf
-seed: 28657
-params: {}
+| flag | config key |
+|---|---|
+| `--training-file` / `--population-file` / `--metadata-file` | `data.training_file` / `data.population_file` / `data.metadata_file` |
+| `--reference-file` | `data.reference_file` |
+| `--encoding-config` | `encoding.config_file` |
+| `--model-type` / `--library` / `--params` | `sdg.model_type` / `sdg.library` / `sdg.parameters` |
+| `--seed` | `experiment.seed` |
+| `--n-samples` | `generation.n_samples` |
+| `--post-process-method` / `--knn-neighbors` / `--distance-metric` / `--fallback` | `post_processing.fix_invalid_categories.{method,knn_neighbors,distance_metric,fallback}` (`enabled: false` → method `none`) |
+| `--hallucination-num-bins` | `evaluation.hallucination.num_bins` |
+| `--privacy-qi-columns` | `evaluation.privacy.metrics[0].parameters.qi_columns` |
+
+The `evaluation.statistical_similarity` / `detection_evaluation` blocks
+(a 15-entry metrics list, per-metric `parameters`, ...) have no sane
+CLI-flag shape and are read straight from the config, with the Step7 values
+as built-in defaults.
+
+Every run nests under `--output-dir/<run-name>/` in the same per-run tree
+layout the production data lake (`sd-lake/<experiment>/<model>/<run>/`)
+uses — so port output maps directly onto a real run folder for comparison.
+The run name is `<tag>_<dseed>_<library>_<model>_mseed<seed>` (e.g.
+`Step7pfp_dseed1597_synthcity_arf_mseed987`), matching sd-lake's run-dir
+convention; `<dseed>` is the `dseedNNN` token from the training-file path,
+`<tag>` comes from `experiment.tag` (dropped from the name when unset).
+`--run-name` overrides the assembled name.
+
+```
+<run-name>/
+  data/encoded/training_<base_name>.csv        # dual-pipeline encode output
+  data/decoded/training_<base_name>.csv
+  data/synthetic/synthetic_data_<base_name>_encoded.csv    # generated synthetic data
+  data/synthetic/synthetic_data_<base_name>_decoded.csv
+  models/training_encoder_<base_name>.pkl      # per-run copy of the population encoder
+  models/sdg_model_<base_name>.pkl             # trained generator
+  models/evaluation_encoder_<base_name>.pkl    # encoder refit on the reference data
+  metrics/{encoding,training,generation,encoding_evaluation}_<base_name>.json
+  metrics/{statistical_similarity,privacy,detection_evaluation,hallucination,tstr}_<base_name>.json
+  metrics/{statistical,privacy,detection,hallucination}_report_<base_name>.txt
 ```
 
-```bash
-uv run python3 flows/sdg_flow.py --config my_run.yaml
-uv run python3 flows/sdg_flow.py --config my_run.yaml --seed 111   # CLI --seed wins over the file's
-```
-
-This exists for settings that don't have a sane CLI-flag shape — the
-upcoming evaluation stages (statistical/privacy/detection metrics) have
-deeply nested per-metric configuration that only really works as a config
-file, not a wall of flags.
-
-This writes, under `--output-dir`:
-
-```
-encoded_training_<base_name>.csv / decoded_training_<base_name>.csv     # dual-pipeline encode output
-training_encoder_<base_name>.pkl                                        # per-run copy of the population encoder
-sdg_model_<base_name>.pkl                                               # trained generator
-synthetic_<base_name>_encoded.csv / synthetic_<base_name>_decoded.csv   # generated synthetic data
-metrics_{encoding,training,generation}_<base_name>.json
-```
-
-where `<base_name>` is `<model-type>_<training-file-stem>_<seed>`. The
+The remaining structural departure from `sd-lake` is `<base_name>` itself —
+`<model-type>_<training-file-stem>_<seed>` here, versus the Hydra
+`experiment_name` template (`synthcity_<model>_<3 data hashes>_gen_<N>_<tag>_<config
+hash>_<mseed>`) in production, which was dropped along with Hydra in the
+scaffolding step. File *contents* still match byte-for-byte. The
 population encoder itself is cached separately under `--encoder-dir`
 (default `outputs/sdg_runs/encoders/`), keyed by a hash of the population
 file's content — fit once per population file and reused across every
@@ -195,3 +242,18 @@ neural-net training in general (same shapes/columns/dtypes, distributions
 in the same range, but not identical values). `nflow` has no production
 run anywhere to compare against — it's smoke-tested only (runs cleanly,
 correct output shape).
+
+The **evaluation stages** were verified the same way: fed each of the four
+production models' real gen-0 encoded/decoded data, every metric block
+reproduces the production data lake's stored JSON bit-for-bit (modulo
+wall-clock timing fields). Two deliberate exceptions:
+
+- `maximum_mean_discrepancy` — the in-pipeline synthcity metric hardcodes
+  `gamma = 1.0` on unit-scaled data and collapses to a `2/n` floor
+  (`≈ 0.0002` for every generator). This port computes the **corrected**
+  MMD instead (z-score on the real reference, a frozen per-variant RBF
+  gamma, unbiased estimator), matching the paper's post-hoc recomputation
+  rather than the degenerate stored value.
+- `alpha_precision`'s `*_OC` fields depend on an unseeded one-class network
+  fit in synthcity 0.2.12, so they are not bit-reproducible across
+  processes; the `*_naive` variant and `prdc_score` are exact.
