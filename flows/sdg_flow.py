@@ -16,7 +16,9 @@ The evaluation stages from sdpype's own "# Evaluation tasks" marker onward
 TSTR + report) are being ported incrementally, one stage per commit, each
 verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
 encode_evaluation, hallucination_evaluation, tstr_evaluation,
-privacy_evaluation, detection_evaluation.
+privacy_evaluation, detection_evaluation, statistical_similarity
+(ks_complement + tv_complement so far; the remaining statistical
+sub-metrics are added one per commit).
 
 Usage:
     python flows/sdg_flow.py \\
@@ -60,7 +62,11 @@ from sdg_core.hashing import calculate_file_hash
 from sdg_core.metadata import load_csv_with_metadata
 from sdg_core.privacy import evaluate_privacy_metrics, generate_privacy_report
 from sdg_core.serialization import create_model_metadata, load_model, save_model
-from sdg_core.statistical import ensure_json_serializable
+from sdg_core.statistical import (
+    ensure_json_serializable,
+    evaluate_statistical_metrics,
+    generate_statistical_report,
+)
 from sdg_core.training import create_experiment_hash, create_synthcity_model
 
 
@@ -1021,6 +1027,120 @@ def detection_evaluation(
     return result
 
 
+# Statistical-similarity data-format routing — copied verbatim from sdpype
+# flows/sdg_flow.py::statistical_similarity. A name in ENCODED_METRICS is fed
+# the RDT-encoded (all-numeric) frames; DECODED_METRICS gets the reverse-
+# transformed frames; anything else falls through to `original`/`synthetic`.
+# The full sets are kept even while only a subset of metrics is ported — they
+# just decide which frames get loaded and passed through.
+_STAT_ENCODED_METRICS = {
+    "alpha_precision", "prdc_score", "jensenshannon_synthcity",
+    "jensenshannon_syndat", "jensenshannon_nannyml", "wasserstein_distance",
+    "maximum_mean_discrepancy", "ks_complement",
+}
+_STAT_DECODED_METRICS = {
+    "tv_complement", "table_structure", "semantic_structure",
+    "boundary_adherence", "category_adherence", "new_row_synthesis",
+    "sdmetrics_quality", "k_anonymization",
+}
+
+
+@task(name="statistical-similarity", log_prints=True)
+def statistical_similarity(
+    metadata_file: str,
+    encoding_config_file: str,
+    encoded_reference_path: str,
+    encoded_synthetic_path: str,
+    decoded_reference_path: str,
+    decoded_synthetic_path: str,
+    base_name: str,
+    output_dir: str,
+    metrics_config: list,
+    force: bool = False,
+) -> dict:
+    """
+    Statistical similarity metrics between reference and synthetic data, with
+    per-metric encoded-vs-decoded data routing (see _STAT_ENCODED_METRICS /
+    _STAT_DECODED_METRICS). Each metric block carries its own per-column scores
+    plus an aggregate.
+
+    Ported from sdpype flows/sdg_flow.py::statistical_similarity — flat args
+    instead of a cfg dict, base_name in place of experiment_name/seed, sd-lake
+    metrics/ layout. Consumes encode_evaluation's encoded + decoded reference
+    and synthetic. `metrics_config` is the evaluation.statistical_similarity.
+    metrics list from the config (Step7 default supplied by the flow).
+    """
+    metadata_file = Path(metadata_file)
+    encoding_config_path = Path(encoding_config_file)
+
+    if not metadata_file.exists():
+        raise FileNotFoundError(f"Required file not found: {metadata_file}")
+
+    metrics_dir = Path(output_dir) / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"statistical_similarity_{base_name}.json"
+    report_path = metrics_dir / f"statistical_report_{base_name}.txt"
+
+    result = {"metrics_path": str(metrics_path), "report_path": str(report_path)}
+    if not force and metrics_path.exists():
+        print(f"Reusing existing statistical metrics: {metrics_path}")
+        return result
+
+    if not metrics_config:
+        print("No statistical metrics configured, skipping")
+        empty = {"metadata": {"status": "skipped"}, "metrics": {}}
+        with open(metrics_path, "w") as f:
+            json.dump(empty, f, indent=2)
+        report_path.write_text("Statistical Similarity Report\nStatus: Skipped\n")
+        return result
+
+    needs_encoded = any(m.get("name") in _STAT_ENCODED_METRICS for m in metrics_config)
+    needs_decoded = any(m.get("name") in _STAT_DECODED_METRICS for m in metrics_config)
+
+    metadata = SingleTableMetadata.load_from_json(str(metadata_file))
+
+    encoding_config = None
+    if needs_encoded and encoding_config_path.exists():
+        encoding_config = load_encoding_config(encoding_config_path)
+
+    reference_data_encoded = synthetic_data_encoded = None
+    reference_data_decoded = synthetic_data_decoded = None
+
+    if needs_encoded:
+        reference_data_encoded = pd.read_csv(encoded_reference_path)
+        synthetic_data_encoded = pd.read_csv(encoded_synthetic_path)
+        print(f"Loaded encoded reference {reference_data_encoded.shape}, synthetic {synthetic_data_encoded.shape}")
+
+    if needs_decoded:
+        reference_data_decoded = load_csv_with_metadata(Path(decoded_reference_path), metadata_file)
+        synthetic_data_decoded = load_csv_with_metadata(Path(decoded_synthetic_path), metadata_file)
+        print(f"Loaded decoded reference {reference_data_decoded.shape}, synthetic {synthetic_data_decoded.shape}")
+
+    print(f"Running {len(metrics_config)} statistical metric(s) ...")
+    results = evaluate_statistical_metrics(
+        reference_data_encoded if needs_encoded else reference_data_decoded,
+        synthetic_data_encoded if needs_encoded else synthetic_data_decoded,
+        metrics_config,
+        experiment_name=base_name,
+        metadata=metadata,
+        reference_data_decoded=reference_data_decoded,
+        synthetic_data_decoded=synthetic_data_decoded,
+        reference_data_encoded=reference_data_encoded,
+        synthetic_data_encoded=synthetic_data_encoded,
+        encoded_metrics=_STAT_ENCODED_METRICS,
+        decoded_metrics=_STAT_DECODED_METRICS,
+        encoding_config=encoding_config,
+    )
+
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    report_path.write_text(generate_statistical_report(results), encoding="utf-8")
+
+    print(f"Saved statistical metrics → {metrics_path}")
+    print(f"Saved statistical report  → {report_path}")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Flow — encode → train → generate → evaluation-encode → hallucination → TSTR → privacy → detection
 # ---------------------------------------------------------------------------
@@ -1046,6 +1166,7 @@ def sdg_pipeline(
     privacy_qi_columns: Optional[list] = None,
     detection_methods: Optional[list] = None,
     detection_common_params: Optional[dict] = None,
+    statistical_metrics: Optional[list] = None,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
@@ -1066,6 +1187,15 @@ def sdg_pipeline(
         ]
     if detection_common_params is None:
         detection_common_params = {"n_folds": 5, "random_state": 987, "reduction": "max"}
+    # evaluation.statistical_similarity.metrics in the yaml. The full Step7
+    # list has 15 entries; the port wires them one at a time, so this interim
+    # default carries only the metrics already ported (grows per commit until
+    # it is the full list). A --config run passes whatever the yaml lists.
+    if statistical_metrics is None:
+        statistical_metrics = [
+            {"name": "ks_complement", "parameters": {"target_columns": None}},
+            {"name": "tv_complement", "parameters": {"target_columns": None}},
+        ]
 
     run_params = {
         "training_file": training_file,
@@ -1189,6 +1319,19 @@ def sdg_pipeline(
         force=force_generate,
     )
 
+    statistical_out = statistical_similarity(
+        metadata_file=metadata_file,
+        encoding_config_file=encoding_config_file,
+        encoded_reference_path=eval_encode_out["encoded_reference"],
+        encoded_synthetic_path=eval_encode_out["encoded_synthetic"],
+        decoded_reference_path=eval_encode_out["decoded_reference"],
+        decoded_synthetic_path=eval_encode_out["decoded_synthetic"],
+        base_name=base_name,
+        output_dir=output_dir,
+        metrics_config=statistical_metrics,
+        force=force_generate,
+    )
+
     return {
         "fit_encoder": fit_out,
         "encode_data": encode_out,
@@ -1199,6 +1342,7 @@ def sdg_pipeline(
         "tstr": tstr_out,
         "privacy": privacy_out,
         "detection": detection_out,
+        "statistical": statistical_out,
     }
 
 
@@ -1350,6 +1494,10 @@ if __name__ == "__main__":
     detection_methods = _cfg_get(config, "evaluation.detection_evaluation.methods", None)
     detection_common_params = _cfg_get(config, "evaluation.detection_evaluation.common_params", None)
 
+    # Statistical similarity is config-only too; None -> sdg_pipeline() falls
+    # back to its interim built-in list (the metrics ported so far).
+    statistical_metrics = _cfg_get(config, "evaluation.statistical_similarity.metrics", None)
+
     # --params is a JSON string on the CLI; sdg.parameters in the config is
     # already a native mapping (YAML parses nested dicts directly).
     if args.params is not None:
@@ -1398,6 +1546,7 @@ if __name__ == "__main__":
         privacy_qi_columns=privacy_qi_columns,
         detection_methods=detection_methods,
         detection_common_params=detection_common_params,
+        statistical_metrics=statistical_metrics,
         encoder_dir=encoder_dir,
         output_dir=output_dir,
     )
