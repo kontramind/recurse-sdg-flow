@@ -17,8 +17,8 @@ TSTR + report) are being ported incrementally, one stage per commit, each
 verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
 encode_evaluation, hallucination_evaluation, tstr_evaluation,
 privacy_evaluation, detection_evaluation, statistical_similarity
-(ks_complement + tv_complement so far; the remaining statistical
-sub-metrics are added one per commit).
+(ks_complement, tv_complement, boundary_adherence, category_adherence so
+far; the remaining statistical sub-metrics are added one per commit).
 
 Usage:
     python flows/sdg_flow.py \\
@@ -1195,6 +1195,8 @@ def sdg_pipeline(
         statistical_metrics = [
             {"name": "ks_complement", "parameters": {"target_columns": None}},
             {"name": "tv_complement", "parameters": {"target_columns": None}},
+            {"name": "boundary_adherence", "parameters": {"target_columns": None}},
+            {"name": "category_adherence", "parameters": {"target_columns": None}},
         ]
 
     run_params = {

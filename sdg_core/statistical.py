@@ -11,8 +11,10 @@ get_encoded_numeric_columns, log_column_selection) — verbatim.
 Lower section: the statistical_similarity metric implementations. Ported
 one metric at a time (the port is being built incrementally); each
 `get_metric_evaluator` case is added with its class. Currently ported:
-  ks_complement   -> KSComplementMetric  (sdmetrics.single_column.KSComplement)
-  tv_complement   -> TVComplementMetric  (sdmetrics.single_column.TVComplement)
+  ks_complement      -> KSComplementMetric       (sdmetrics.single_column.KSComplement)
+  tv_complement      -> TVComplementMetric       (sdmetrics.single_column.TVComplement)
+  boundary_adherence -> BoundaryAdherenceMetric  (sdmetrics.single_column.BoundaryAdherence)
+  category_adherence -> CategoryAdherenceMetric  (sdmetrics.single_column.CategoryAdherence)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -33,7 +35,12 @@ import numpy as np
 import pandas as pd
 from sdv.metadata import SingleTableMetadata
 
-from sdmetrics.single_column import KSComplement, TVComplement
+from sdmetrics.single_column import (
+    BoundaryAdherence,
+    CategoryAdherence,
+    KSComplement,
+    TVComplement,
+)
 
 
 def ensure_json_serializable(obj: Any) -> Any:
@@ -379,6 +386,229 @@ class TVComplementMetric:
         return compatible_columns
 
 
+class BoundaryAdherenceMetric:
+    """BoundaryAdherence metric implementation for column-wise boundary validation"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        self.target_columns = parameters.get("target_columns", None)  # None = all numerical/datetime
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate BoundaryAdherence metric across compatible columns"""
+        start_time = time.time()
+
+        try:
+            # Identify compatible columns (numerical and datetime)
+            compatible_columns = self._get_compatible_columns(metadata)
+
+            if self.target_columns:
+                # Filter to only requested columns that are also compatible
+                target_set = set(self.target_columns)
+                compatible_set = set(compatible_columns)
+                valid_targets = list(target_set.intersection(compatible_set))
+                invalid_targets = list(target_set - compatible_set)
+
+                if invalid_targets:
+                    print(f"Warning: These target columns are not compatible with BoundaryAdherence: {invalid_targets}")
+
+                if not valid_targets:
+                    return {
+                        "aggregate_score": None,
+                        "column_scores": {},
+                        "compatible_columns": compatible_columns,
+                        "parameters": self.parameters,
+                        "execution_time": time.time() - start_time,
+                        "status": "success",
+                        "message": f"No compatible columns found from target list: {self.target_columns}"
+                    }
+
+                columns_to_evaluate = valid_targets
+            else:
+                columns_to_evaluate = compatible_columns
+
+            if not columns_to_evaluate:
+                return {
+                    "aggregate_score": None,
+                    "column_scores": {},
+                    "compatible_columns": compatible_columns,
+                    "parameters": self.parameters,
+                    "execution_time": time.time() - start_time,
+                    "status": "success",
+                    "message": "No compatible numerical/datetime columns found in the dataset"
+                }
+
+            # Calculate BoundaryAdherence for each compatible column
+            column_scores = {}
+            failed_columns = []
+            for column in columns_to_evaluate:
+                try:
+                    # Convert datetime columns to datetime64 dtype if needed
+                    # SDMetrics BoundaryAdherence expects datetime64, not object/string
+                    orig_col = original[column]
+                    synth_col = synthetic[column]
+
+                    # Check if column should be datetime based on metadata
+                    col_sdtype = metadata.columns[column].get('sdtype') if column in metadata.columns else None
+                    if col_sdtype == 'datetime' and orig_col.dtype == 'object':
+                        # Convert string datetime to datetime64
+                        orig_col = pd.to_datetime(orig_col, errors='coerce')
+                        synth_col = pd.to_datetime(synth_col, errors='coerce')
+
+                    score = BoundaryAdherence.compute(
+                        real_data=orig_col,
+                        synthetic_data=synth_col
+                    )
+                    column_scores[column] = float(score)
+                except Exception as e:
+                    print(f"Error computing BoundaryAdherence for column {column}: {e}")
+                    column_scores[column] = None
+                    failed_columns.append(column)
+
+            # Extract successful scores (exclude None values from failures)
+            successful_scores = [score for score in column_scores.values() if score is not None]
+
+            if not successful_scores:
+                return {
+                    "aggregate_score": None,
+                    "column_scores": column_scores,
+                    "compatible_columns": compatible_columns,
+                    "failed_columns": failed_columns,
+                    "successful_columns": 0,
+                    "parameters": self.parameters,
+                    "execution_time": time.time() - start_time,
+                    "status": "success",
+                    "message": "All column evaluations failed"
+                }
+
+            # Calculate aggregate score as mean of successful column scores only
+            aggregate_score = float(np.mean(successful_scores))
+
+            return {
+                "aggregate_score": aggregate_score,
+                "column_scores": column_scores,
+                "compatible_columns": compatible_columns,
+                "failed_columns": failed_columns,
+                "successful_columns": len(successful_scores),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "aggregate_score": 0.0,
+                "column_scores": {},
+                "compatible_columns": [],
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+    def _get_compatible_columns(self, metadata: SingleTableMetadata) -> List[str]:
+        """Get columns compatible with BoundaryAdherence (numerical and datetime) from SDV metadata"""
+
+        compatible_columns = []
+        for column_name, column_info in metadata.columns.items():
+            sdtype = column_info.get('sdtype', 'unknown')
+            if sdtype in ['numerical', 'datetime']:
+                compatible_columns.append(column_name)
+
+        return compatible_columns
+
+
+class CategoryAdherenceMetric:
+    """CategoryAdherence metric implementation for categorical/boolean column validation"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        self.target_columns = parameters.get("target_columns", None)  # None = all categorical/boolean
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate CategoryAdherence metric across compatible columns"""
+        start_time = time.time()
+
+        try:
+            # Identify compatible columns (categorical and boolean)
+            compatible_columns = self._get_compatible_columns(metadata)
+
+            if self.target_columns:
+                # Filter to only requested columns that are also compatible
+                target_set = set(self.target_columns)
+                compatible_set = set(compatible_columns)
+                valid_targets = list(target_set.intersection(compatible_set))
+
+                # Warn about invalid target columns
+                invalid_targets = target_set - compatible_set
+                if invalid_targets:
+                    print(f"Warning: Columns {invalid_targets} are not compatible with CategoryAdherence (not categorical/boolean)")
+
+                columns_to_evaluate = valid_targets
+            else:
+                columns_to_evaluate = compatible_columns
+
+            if not columns_to_evaluate:
+                return {
+                    "aggregate_score": None,
+                    "column_scores": {},
+                    "compatible_columns": compatible_columns,
+                    "parameters": self.parameters,
+                    "execution_time": time.time() - start_time,
+                    "status": "success",
+                    "message": f"No compatible categorical/boolean columns found for evaluation"
+                }
+
+            # Evaluate each column
+            column_scores = {}
+            failed_columns = []
+            for column in columns_to_evaluate:
+                try:
+                    score = CategoryAdherence.compute(
+                        real_data=original[column],
+                        synthetic_data=synthetic[column]
+                    )
+                    column_scores[column] = float(score)
+                except Exception as e:
+                    print(f"Warning: Failed to compute CategoryAdherence for column '{column}': {str(e)}")
+                    column_scores[column] = None
+                    failed_columns.append(column)
+
+            # Calculate aggregate score - exclude failed (None) columns
+            successful_scores = [score for score in column_scores.values() if score is not None]
+            aggregate_score = float(np.mean(successful_scores)) if successful_scores else None
+
+            return {
+                "aggregate_score": aggregate_score,
+                "column_scores": column_scores,
+                "compatible_columns": compatible_columns,
+                "failed_columns": failed_columns,
+                "successful_columns": len(successful_scores),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "aggregate_score": 0.0,
+                "column_scores": {},
+                "compatible_columns": [],
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+    def _get_compatible_columns(self, metadata: SingleTableMetadata) -> List[str]:
+        """Get columns compatible with CategoryAdherence (categorical and boolean) from SDV metadata"""
+
+        compatible_columns = []
+        for column_name, column_info in metadata.columns.items():
+            sdtype = column_info.get('sdtype', 'unknown')
+            if sdtype in ['categorical', 'boolean']:
+                compatible_columns.append(column_name)
+
+        return compatible_columns
+
+
 # ===========================================================================
 # Dispatch
 # ===========================================================================
@@ -511,6 +741,10 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return KSComplementMetric(**parameters)
         case "tv_complement":
             return TVComplementMetric(**parameters)
+        case "boundary_adherence":
+            return BoundaryAdherenceMetric(**parameters)
+        case "category_adherence":
+            return CategoryAdherenceMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 
