@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Generated data / run artifacts (output of prepare_step7.py and later the pipeline)
+/Step7/
+/Step6/
+/Step5/
+/outputs/
+
+# Prefect / temp config
+params._prefect_*.yaml
+*.backup
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Claude Code local config (never commit)
+.claude/

@@ -1,0 +1,21 @@
+[project]
+name = "recurse-sdg-flow"
+version = "0.1.0"
+description = "Recursive synthetic data generation pipeline"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # Pinned to match sdpype's currently-installed versions, to keep the
+    # Step 2 parity test (diffing against ../rd-lake/Step7/...) deterministic.
+    "pandas==2.3.3",
+    "numpy==1.26.4",
+    "scikit-learn==1.7.2",
+    "openpyxl>=3.1.0",
+    "pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sdg_core"]
