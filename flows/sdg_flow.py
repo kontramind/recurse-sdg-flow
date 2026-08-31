@@ -15,7 +15,7 @@ The evaluation stages from sdpype's own "# Evaluation tasks" marker onward
 (encode_evaluation, then statistical / privacy / detection / hallucination /
 TSTR + report) are being ported incrementally, one stage per commit, each
 verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
-encode_evaluation.
+encode_evaluation, hallucination_evaluation, tstr_evaluation.
 
 Usage:
     python flows/sdg_flow.py \\
@@ -41,6 +41,8 @@ import torch
 import yaml
 from prefect import flow, task
 
+from flows.lgbm_cv_flow import encode_features, evaluate_on_test, train_final_model
+from sdg_core.downstream import LGBMBayesianTuner
 from sdg_core.encoding import RDTDatasetEncoder, load_encoding_config
 from sdg_core.generation import apply_post_processing
 from sdg_core.hallucination import (
@@ -713,8 +715,171 @@ def hallucination_evaluation(
     return result
 
 
+@task(name="tstr-evaluation", log_prints=True)
+def tstr_evaluation(
+    dseed_dir: str,
+    synth_decoded_path: str,
+    base_name: str,
+    output_dir: str,
+    seed: int = 42,
+    force: bool = False,
+) -> dict:
+    """
+    Train on Synthetic, Test on Real. Trains LightGBM on the decoded synthetic
+    data using the *frozen* best_params + decision threshold from the dseed
+    folder's lgbm_cv_*.json (the TRTR baseline), evaluates on that folder's
+    real held-out test set, and reports the utility gap.
+
+    Freezing the params/threshold (rather than re-tuning per run) is deliberate
+    — it keeps every generation on the same operating point so a utility drop
+    reflects data quality, not optimizer drift.
+
+    Ported from sdpype flows/sdg_flow.py::tstr_evaluation — flat args instead of
+    a cfg dict, base_name passed in, sd-lake metrics/ layout. Reuses Step 3's
+    ported LGBMBayesianTuner + lgbm_cv_flow tasks (encode_features /
+    train_final_model / evaluate_on_test).
+
+    dseed_dir: the folder holding lgbm_cv_*.json + the one *test*.csv — i.e.
+    Path(training_file).parent. (Once recursion exists this must stay pinned to
+    the original dseed folder, not a per-generation synthetic path.)
+    """
+    start_time = time.time()
+    dseed_dir = Path(dseed_dir)
+
+    metrics_dir = Path(output_dir) / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"tstr_{base_name}.json"
+
+    if not force and metrics_path.exists():
+        print(f"Reusing existing TSTR metrics: {metrics_path}")
+        payload = json.loads(metrics_path.read_text())
+        return {**payload, "metrics_path": str(metrics_path)}
+
+    # --- Auto-discover lgbm_cv JSON (latest by filename timestamp) ---
+    lgbm_candidates = sorted(dseed_dir.glob("lgbm_cv_*.json"))
+    if not lgbm_candidates:
+        raise FileNotFoundError(
+            f"No lgbm_cv_*.json found in dseed folder: {dseed_dir}\n"
+            f"Run flows/lgbm_cv_flow.py with --output-dir {dseed_dir} first."
+        )
+    tstr_params_file = lgbm_candidates[-1]
+    print(f"Auto-discovered lgbm_cv JSON: {tstr_params_file}")
+
+    with open(tstr_params_file) as f:
+        lgbm_payload = json.load(f)
+    best_params = lgbm_payload["best_params"]
+    trtr_metrics = lgbm_payload["test_metrics"]
+    target_col = lgbm_payload["data_info"]["target"]
+    print(f"Target column: {target_col}  |  TRTR baseline AUROC: {trtr_metrics['auroc']:.4f}")
+
+    # --- Auto-discover the one real test file ---
+    candidates = sorted(dseed_dir.glob("*test*.csv"))
+    if len(candidates) == 0:
+        raise FileNotFoundError(f"No *test*.csv found in dseed folder: {dseed_dir}")
+    if len(candidates) > 1:
+        raise FileNotFoundError(
+            f"Multiple *test*.csv files found in {dseed_dir}: {[c.name for c in candidates]}. "
+            f"Cannot auto-discover — ensure only one test file exists."
+        )
+    test_path = candidates[0]
+    print(f"Auto-discovered real test file: {test_path}")
+
+    synth_df = pd.read_csv(synth_decoded_path)
+    test_df = pd.read_csv(test_path)
+
+    for name, df in (("synthetic", synth_df), ("test", test_df)):
+        if target_col not in df.columns:
+            raise ValueError(
+                f"Target column '{target_col}' (from lgbm_cv JSON) not found in {name} data. "
+                f"Columns: {list(df.columns)}"
+            )
+
+    X_synth = synth_df.drop(columns=[target_col])
+    y_synth = synth_df[target_col].astype(int)
+    X_test = test_df.drop(columns=[target_col])
+    y_test = test_df[target_col].astype(int)
+    print(f"Synth train: {len(X_synth):,} rows  |  Real test: {len(X_test):,} rows")
+
+    # --- Guard: synthetic data must have both classes ---
+    if y_synth.nunique() < 2:
+        present = y_synth.unique().tolist()
+        msg = (
+            f"TSTR skipped — synthetic training data contains only class {present} "
+            f"(model collapsed to single class). Classification not possible."
+        )
+        print(msg)
+        return {
+            "base_name": base_name,
+            "status": "skipped",
+            "skip_reason": msg,
+            "tstr_metrics": None,
+            "trtr_metrics": trtr_metrics,
+            "utility_gap": None,
+            "metrics_path": None,
+        }
+
+    # --- Categorical encoding (fit on synth, apply to test) ---
+    X_synth_enc, X_test_enc = encode_features(X_synth, X_test)
+
+    # --- Train on synthetic with the frozen real-data best_params ---
+    tuner = LGBMBayesianTuner(
+        X_train=X_synth_enc,
+        y_train=y_synth,
+        n_folds=3,
+        n_trials=1,
+        random_state=seed,
+    )
+    tuner.best_params = best_params
+
+    # Evaluate every generation at the same operating point (real-data threshold).
+    fixed_threshold = trtr_metrics["threshold"]
+
+    try:
+        model, _synth_threshold, target_encoder, calibrator = train_final_model(
+            X_synth_enc, y_synth, best_params, tuner, seed=seed, quiet=True,
+        )
+    except ValueError as e:
+        msg = f"TSTR skipped — training failed (likely single-class split in synthetic data): {e}"
+        print(msg)
+        return {
+            "base_name": base_name,
+            "status": "skipped",
+            "skip_reason": msg,
+            "tstr_metrics": None,
+            "trtr_metrics": trtr_metrics,
+            "utility_gap": None,
+            "metrics_path": None,
+        }
+
+    tstr_metrics = evaluate_on_test(
+        model, X_test_enc, y_test, fixed_threshold, target_encoder, calibrator
+    )
+
+    utility_gap = trtr_metrics["auroc"] - tstr_metrics["auroc"]
+    print(
+        f"TSTR AUROC: {tstr_metrics['auroc']:.4f}  |  TRTR AUROC: {trtr_metrics['auroc']:.4f}  |  "
+        f"Utility gap: {utility_gap:+.4f}"
+    )
+
+    payload = {
+        "base_name": base_name,
+        "tstr_params_source": str(tstr_params_file),
+        "train_rows_synth": len(X_synth),
+        "test_rows_real": len(X_test),
+        "trtr_metrics": trtr_metrics,
+        "tstr_metrics": tstr_metrics,
+        "utility_gap": utility_gap,
+        "execution_time": time.time() - start_time,
+    }
+    with open(metrics_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Saved TSTR metrics → {metrics_path}")
+
+    return {**payload, "metrics_path": str(metrics_path)}
+
+
 # ---------------------------------------------------------------------------
-# Flow — encode → train → generate → evaluation-encode → hallucination
+# Flow — encode → train → generate → evaluation-encode → hallucination → TSTR
 # ---------------------------------------------------------------------------
 
 @flow(name="sdg-pipeline")
@@ -830,6 +995,18 @@ def sdg_pipeline(
         force=force_generate,
     )
 
+    # TSTR needs the dseed folder (lgbm_cv_*.json + the one *test*.csv). Today
+    # that is simply the training file's parent; a future recursive flow must
+    # keep this pinned to the *original* dseed folder, not gen-N's synthetic.
+    tstr_out = tstr_evaluation(
+        dseed_dir=str(Path(training_file).parent),
+        synth_decoded_path=generate_out["decoded_path"],
+        base_name=base_name,
+        output_dir=output_dir,
+        seed=seed,
+        force=force_generate,
+    )
+
     return {
         "fit_encoder": fit_out,
         "encode_data": encode_out,
@@ -837,6 +1014,7 @@ def sdg_pipeline(
         "generate_synthetic": generate_out,
         "encode_evaluation": eval_encode_out,
         "hallucination": halluc_out,
+        "tstr": tstr_out,
     }
 
 
@@ -891,7 +1069,7 @@ def _resolve(cli_value, config: dict, key: str, default=None):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the SDG pipeline (encode -> train -> generate -> encode_evaluation -> hallucination)",
+        description="Run the SDG pipeline (encode -> train -> generate -> encode_evaluation -> hallucination -> tstr)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="Optional path to a plain YAML config file; CLI flags below override it")
@@ -908,7 +1086,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--post-process-method", default=None, choices=sorted(VALID_POST_PROCESS_METHODS), help="Invalid-category fixing method ('none' disables post-processing)")
     parser.add_argument("--knn-neighbors", type=int, default=None, help="Neighbors for the 'knn' post-process method")
     parser.add_argument("--distance-metric", default=None, help="Distance metric for the 'knn' post-process method")
-    parser.add_argument("--fallback", default=None, choices=sorted(VALID_FALLBACKS), help="Fallback method when a column is 100% invalid")
+    parser.add_argument("--fallback", default=None, choices=sorted(VALID_FALLBACKS), help="Fallback method when a column is 100%% invalid")
     parser.add_argument("--force-generate", action="store_true", default=None, help="Regenerate synthetic data even if cached output exists")
     parser.add_argument("--hallucination-num-bins", type=int, default=None, help="Bins for the hallucination metric's numerical quantisation (or evaluation.hallucination.num_bins in --config)")
     parser.add_argument("--encoder-dir", default=None, help="Shared population-encoder cache dir")
