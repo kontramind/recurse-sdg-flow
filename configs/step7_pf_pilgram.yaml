@@ -7,6 +7,8 @@
 
 experiment:
   seed: 987
+  generation: 0
+  tag: Step7pfp
 
 sdg:
   library: synthcity

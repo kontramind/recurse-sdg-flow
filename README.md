@@ -148,9 +148,9 @@ The `--config` file mirrors sdpype's `params_step7_*.yaml` nested layout —
 `post_processing` / `evaluation` — so it maps 1:1 onto the original
 experiment configs. It is a plain `yaml.safe_load`: no Hydra interpolation,
 `${...}` templating, or config-group composition (the Hydra-only
-`experiment.name` / `tags` templates are omitted — the port names runs
-`<model>_<training-stem>_<seed>`). A CLI flag always wins over the file.
-CLI-flag ↔ config-key mapping:
+`experiment.name` / `tags` templates are omitted; `experiment.tag` is kept
+— it names the run directory, see below). A CLI flag always wins over the
+file. CLI-flag ↔ config-key mapping:
 
 | flag | config key |
 |---|---|
@@ -169,21 +169,27 @@ The `evaluation.statistical_similarity` / `detection_evaluation` blocks
 CLI-flag shape and are read straight from the config, with the Step7 values
 as built-in defaults.
 
-This writes, under `--output-dir`, in the same per-run tree layout the
-production data lake (`sd-lake/<run>/`) uses — so port output maps
-directly onto a real run folder for comparison:
+When `experiment.tag` is set (or `--run-name` is given), everything nests
+under `--output-dir/<run-name>/` in the same per-run tree layout the
+production data lake (`sd-lake/<experiment>/<model>/<run>/`) uses — so port
+output maps directly onto a real run folder for comparison. The run name is
+`<tag>_<dseed>_<library>_<model>_mseed<seed>` (e.g.
+`Step7pfp_dseed1597_synthcity_arf_mseed987`), matching sd-lake's run-dir
+convention; `<dseed>` is the `dseedNNN` token from the training-file path.
+Without a tag / `--run-name`, `--output-dir` itself is the run dir (flat).
 
 ```
-data/encoded/training_<base_name>.csv        # dual-pipeline encode output
-data/decoded/training_<base_name>.csv
-data/synthetic/synthetic_data_<base_name>_encoded.csv    # generated synthetic data
-data/synthetic/synthetic_data_<base_name>_decoded.csv
-models/training_encoder_<base_name>.pkl      # per-run copy of the population encoder
-models/sdg_model_<base_name>.pkl             # trained generator
-metrics/{encoding,training,generation}_<base_name>.json
+<run-name>/
+  data/encoded/training_<base_name>.csv        # dual-pipeline encode output
+  data/decoded/training_<base_name>.csv
+  data/synthetic/synthetic_data_<base_name>_encoded.csv    # generated synthetic data
+  data/synthetic/synthetic_data_<base_name>_decoded.csv
+  models/training_encoder_<base_name>.pkl      # per-run copy of the population encoder
+  models/sdg_model_<base_name>.pkl             # trained generator
+  metrics/{encoding,training,generation}_<base_name>.json
 ```
 
-The only structural departure from `sd-lake` is `<base_name>` itself —
+The remaining structural departure from `sd-lake` is `<base_name>` itself —
 `<model-type>_<training-file-stem>_<seed>` here, versus the Hydra
 `experiment_name` template (`synthcity_<model>_<3 data hashes>_gen_<N>_<tag>_<config
 hash>_<mseed>`) in production, which was dropped along with Hydra in the

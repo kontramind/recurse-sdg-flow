@@ -6,13 +6,16 @@
 # yaml.safe_load — no Hydra interpolation, config groups, or `${...}`
 # templating (that machinery was dropped in the scaffolding step). The
 # Hydra-only `experiment.name` / `tags` templates are omitted for the same
-# reason; the port names runs `<model>_<training-stem>_<seed>` instead.
+# reason. `tag` is kept (plain scalar, not a template): it names the run
+# directory, sd-lake-style — <tag>_<dseed>_<library>_<model>_mseed<seed>.
 
 experiment:
   # Model seed. Production sweeps this per run (the mseed in the sd-lake
   # folder name, e.g. mseed28657); 987 is the config default. Override
   # with --seed.
   seed: 987
+  generation: 0
+  tag: Step7pfa
 
 sdg:
   library: synthcity          # only 'synthcity' is implemented

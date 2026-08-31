@@ -32,6 +32,7 @@ Usage:
 import argparse
 import json
 import random
+import re
 import shutil
 import time
 from datetime import datetime
@@ -1145,6 +1146,20 @@ def statistical_similarity(
 # Flow — encode → train → generate → evaluation-encode → hallucination → TSTR → privacy → detection
 # ---------------------------------------------------------------------------
 
+def _run_name(tag: str, training_file: str, library: str, model_type: str, seed: int) -> str:
+    """Assemble the sd-lake run-directory name.
+
+    sd-lake nests each run as
+        <lake>/<experiment>/<model_type>/<tag>_<dseed>_<library>_<model>_mseed<seed>/
+    e.g. Step7pfp_dseed1597_synthcity_arf_mseed987 — where <dseed> is the
+    dseedNNN token from the training-file path. Falls back to the training
+    stem when no dseed token is present.
+    """
+    m = re.search(r"dseed\d+", Path(training_file).stem)
+    dseed = m.group(0) if m else Path(training_file).stem
+    return f"{tag}_{dseed}_{library}_{model_type}_mseed{seed}"
+
+
 @flow(name="sdg-pipeline")
 def sdg_pipeline(
     training_file: str,
@@ -1167,6 +1182,8 @@ def sdg_pipeline(
     detection_methods: Optional[list] = None,
     detection_common_params: Optional[dict] = None,
     statistical_metrics: Optional[list] = None,
+    experiment_tag: Optional[str] = None,
+    run_name: Optional[str] = None,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
@@ -1198,6 +1215,18 @@ def sdg_pipeline(
             {"name": "boundary_adherence", "parameters": {"target_columns": None}},
             {"name": "category_adherence", "parameters": {"target_columns": None}},
         ]
+
+    # Run-directory wrapper. When experiment_tag (or an explicit run_name) is
+    # given, nest all artefacts under output_dir/<run_name>/ so the tree maps
+    # 1:1 onto a sd-lake run dir (data/ models/ metrics/ under a
+    # <tag>_<dseed>_<library>_<model>_mseed<seed> folder). Without either, the
+    # old flat behaviour is kept — output_dir is the run dir.
+    if run_name is None and experiment_tag:
+        run_name = _run_name(experiment_tag, training_file, library, model_type, seed)
+    if run_name:
+        output_dir = str(Path(output_dir) / run_name)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    print(f"Run directory: {output_dir}")
 
     run_params = {
         "training_file": training_file,
@@ -1335,6 +1364,7 @@ def sdg_pipeline(
     )
 
     return {
+        "run_dir": output_dir,
         "fit_encoder": fit_out,
         "encode_data": encode_out,
         "train_sdg": train_out,
@@ -1441,7 +1471,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hallucination-num-bins", type=int, default=None, help="Bins for the hallucination metric's numerical quantisation (or evaluation.hallucination.num_bins in --config)")
     parser.add_argument("--privacy-qi-columns", default=None, help="Comma-separated quasi-identifier columns for k-anonymity (or evaluation.privacy.metrics[0].parameters.qi_columns in --config; default: pf_all set)")
     parser.add_argument("--encoder-dir", default=None, help="Shared population-encoder cache dir")
-    parser.add_argument("--output-dir", default=None, help="Per-run output directory")
+    parser.add_argument("--output-dir", default=None, help="Root output directory; runs nest under it as <run-name>/ when a run name is resolvable (see --run-name / experiment.tag)")
+    parser.add_argument("--run-name", default=None, help="Explicit run-directory name under --output-dir (default: <tag>_<dseed>_<library>_<model>_mseed<seed> when experiment.tag is set, else flat in --output-dir)")
     return parser.parse_args()
 
 
@@ -1474,6 +1505,10 @@ if __name__ == "__main__":
     force_generate = _pick(args.force_generate, config, "force_generate", _DEFAULTS["force_generate"])
     encoder_dir = _pick(args.encoder_dir, config, "encoder_dir", _DEFAULTS["encoder_dir"])
     output_dir = _pick(args.output_dir, config, "output_dir", _DEFAULTS["output_dir"])
+    # experiment.tag (Step7pfa / Step7pfp) drives the sd-lake-style run-dir
+    # wrapper; --run-name overrides the assembled name outright.
+    experiment_tag = _cfg_get(config, "experiment.tag", None)
+    run_name = args.run_name
 
     if args.hallucination_num_bins is not None:
         hallucination_num_bins = args.hallucination_num_bins
@@ -1549,6 +1584,8 @@ if __name__ == "__main__":
         detection_methods=detection_methods,
         detection_common_params=detection_common_params,
         statistical_metrics=statistical_metrics,
+        experiment_tag=experiment_tag,
+        run_name=run_name,
         encoder_dir=encoder_dir,
         output_dir=output_dir,
     )
