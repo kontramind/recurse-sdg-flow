@@ -24,6 +24,8 @@ one metric at a time (the port is being built incrementally); each
   jensenshannon_synthcity -> JensenShannonSynthcityMetric  (synthcity JensenShannonDistance)
   jensenshannon_nannyml   -> JensenShannonNannyMLMetric    (scipy Doane-binned JSD; the
     module-level `from nannyml...` import in sdpype is dead code and is NOT carried)
+  maximum_mean_discrepancy -> MaximumMeanDiscrepancyMetric  (corrected MMD, NOT synthcity's
+    — see the module docstring)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -32,6 +34,19 @@ Differences from sdpype: the 2 `OmegaConf.is_config(parameters)` lines in
 `evaluate_statistical_metrics` are dropped (no Hydra here); the module-level
 `from rich import print` is not carried (same choice as the rest of the port
 — builtin print, rich markup rendered literally where sdpype emits it).
+
+`maximum_mean_discrepancy` is DELIBERATELY NOT synthcity's implementation.
+synthcity's `MaximumMeanDiscrepancy` hardcodes gamma=1.0 on RDT-native-unit
+data, so the RBF kernel underflows and the biased estimator collapses to
+2/n ≈ 0.0002 for every generator (see sdpype's recompute_mmd_corrected.py).
+`MaximumMeanDiscrepancyMetric` here is that script's corrected computation
+inlined as a per-run metric: z-score every column on the REAL reference,
+a frozen per-variant RBF gamma (median heuristic on the standardized real
+reference, pooled over the variant's dseeds — Step7pfa 0.02524003218131145,
+Step7pfp 0.048527854564490464; supply via the `gamma` parameter), and the
+UNBIASED MMD^2 estimator (k(x,x) diagonals dropped). This does NOT match
+sd-lake's stored `maximum_mean_discrepancy` block — it matches
+metrics_long_<variant>_mmd_corrected.csv.
 
 Uses the real sdv.metadata.SingleTableMetadata.
 """
@@ -51,6 +66,7 @@ from sdmetrics.single_column import (
     TVComplement,
 )
 from sdmetrics.single_table import TableStructure
+from sklearn.metrics.pairwise import euclidean_distances, rbf_kernel
 from syndat.metrics import jensen_shannon_distance as syndat_jsd
 from synthcity.metrics.eval_statistical import (
     AlphaPrecision,
@@ -1294,6 +1310,128 @@ class JensenShannonNannyMLMetric:
             }
 
 
+# Chunk size for the pairwise RBF kernel sum; matches recompute_mmd_corrected.py
+# so the chunked float summation order (and thus the last ULPs) is identical.
+_MMD_CHUNK = 2000
+
+
+def _mmd_kernel_sum(A: np.ndarray, B: np.ndarray, gamma: float) -> float:
+    """Sum of the RBF kernel over all pairs, chunked to bound peak memory."""
+    total = 0.0
+    for i in range(0, len(A), _MMD_CHUNK):
+        total += float(rbf_kernel(A[i:i + _MMD_CHUNK], B, gamma).sum())
+    return total
+
+
+def _mmd_median_sqdist(X: np.ndarray, sample: int = 2000, seed: int = 0) -> float:
+    """Median pairwise squared distance on a subsample (median heuristic)."""
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(X), min(sample, len(X)), replace=False)
+    S = X[idx]
+    d2 = euclidean_distances(S, S, squared=True)
+    off = d2[~np.eye(len(S), dtype=bool)]
+    return float(np.median(off))
+
+
+class MaximumMeanDiscrepancyMetric:
+    """Maximum Mean Discrepancy — the CORRECTED computation (not synthcity's).
+
+    synthcity's MaximumMeanDiscrepancy hardcodes gamma=1.0 on RDT-native-unit
+    data: the RBF kernel underflows and the biased estimator collapses to
+    2/n ≈ 0.0002 for every generator. This reimplements sdpype's
+    recompute_mmd_corrected.py as a per-run metric:
+
+      1. z-score every column using the REAL reference mean/sd (ddof=0);
+         constant columns (sd == 0) are left uncentred by scale (sd -> 1).
+      2. RBF gamma: the ``gamma`` parameter when given (the paper freezes a
+         per-variant value — Step7pfa 0.02524003218131145,
+         Step7pfp 0.048527854564490464 — a median heuristic on the
+         standardized real reference pooled over the variant's dseeds). With
+         no ``gamma`` it falls back to the median heuristic on THIS run's
+         standardized reference (sample=2000, seed=0) — close but not the
+         frozen value.
+      3. the UNBIASED MMD^2 estimator: the k(x,x) = 1 diagonals are dropped
+         from XX and YY, so the 2/n floor disappears and an exact match
+         scores ~0.
+
+    Runs on ENCODED data (native units — the standardization is what makes
+    the kernel well-scaled). Output ``joint_distance`` is the corrected MMD^2
+    and will NOT match sd-lake's stored block; it matches
+    metrics_long_<variant>_mmd_corrected.csv.
+    """
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        self.kernel = parameters.get("kernel", "rbf")
+        self.gamma = parameters.get("gamma", None)
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate the corrected Maximum Mean Discrepancy."""
+        start_time = time.time()
+
+        try:
+            if self.kernel != "rbf":
+                raise ValueError(f"Only the RBF kernel is supported, got {self.kernel!r}")
+
+            cols = list(original.columns)
+            if list(synthetic.columns) != cols:
+                synthetic = synthetic[cols]
+
+            A = original.to_numpy(dtype=float)
+            B = synthetic.to_numpy(dtype=float)
+
+            # Standardize on the REAL reference (never synthetic stats).
+            mu = A.mean(axis=0)
+            sd = A.std(axis=0)
+            sd[sd == 0] = 1.0
+            As = (A - mu) / sd
+            Bs = (B - mu) / sd
+
+            gamma = self.gamma
+            gamma_source = "parameter"
+            if gamma is None:
+                gamma = 1.0 / _mmd_median_sqdist(As)
+                gamma_source = "median_heuristic_this_run"
+            gamma = float(gamma)
+
+            n, m = len(As), len(Bs)
+            xx = _mmd_kernel_sum(As, As, gamma)
+            yy = _mmd_kernel_sum(Bs, Bs, gamma)
+            xy = _mmd_kernel_sum(As, Bs, gamma)
+
+            # Drop the k(x, x) = 1 diagonals: n of them in XX, m in YY.
+            xx_u = (xx - n) / (n * (n - 1))
+            yy_u = (yy - m) / (m * (m - 1))
+            xy_mean = xy / (n * m)
+            mmd = xx_u + yy_u - 2 * xy_mean
+
+            return {
+                "joint_distance": float(mmd),
+                "kernel": self.kernel,
+                "gamma": gamma,
+                "gamma_source": gamma_source,
+                "estimator": "unbiased",
+                "standardization": "z-score on real reference",
+                "terms": {
+                    "xx_unbiased": float(xx_u),
+                    "yy_unbiased": float(yy_u),
+                    "xy_mean": float(xy_mean),
+                },
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "joint_distance": 1.0,
+                "kernel": self.kernel,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
 # ===========================================================================
 # Dispatch
 # ===========================================================================
@@ -1444,6 +1582,8 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return JensenShannonSyndatMetric(**parameters)
         case "jensenshannon_nannyml":
             return JensenShannonNannyMLMetric(**parameters)
+        case "maximum_mean_discrepancy":
+            return MaximumMeanDiscrepancyMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 
