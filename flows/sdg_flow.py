@@ -13,9 +13,9 @@ generate_synthetic. Everything from sdg_flow.py's own "# Evaluation tasks"
 marker onward (statistical/privacy/detection/hallucination/TSTR + report) is
 a separate, later step — not ported here.
 
-This checkpoint adds train_sdg (arf/ctgan/ddpm/rtvae/nflow, synthcity-only)
-on top of the already-verified fit_encoder + encode_data. generate_synthetic
-is not wired yet.
+This checkpoint adds generate_synthetic on top of the already-verified
+fit_encoder + encode_data + train_sdg — the full encode → train → generate
+chain (arf/ctgan/ddpm/rtvae/nflow, synthcity-only) is now wired.
 
 Usage:
     python flows/sdg_flow.py \\
@@ -28,18 +28,23 @@ Usage:
 
 import argparse
 import json
+import random
 import shutil
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
+import numpy as np
 import pandas as pd
+import torch
 from prefect import flow, task
 
 from sdg_core.encoding import RDTDatasetEncoder, load_encoding_config
+from sdg_core.generation import apply_post_processing
 from sdg_core.hashing import calculate_file_hash
 from sdg_core.metadata import load_csv_with_metadata
-from sdg_core.serialization import create_model_metadata, save_model
+from sdg_core.serialization import create_model_metadata, load_model, save_model
 from sdg_core.training import create_experiment_hash, create_synthcity_model
 
 
@@ -294,8 +299,140 @@ def train_sdg(
     }
 
 
+@task(name="generate-synthetic", log_prints=True)
+def generate_synthetic(
+    model_path: str,
+    training_encoder_path: str,
+    training_file: str,
+    metadata_file: str,
+    reference_file: str,
+    encoded_training_path: str,
+    model_type: str,
+    library: str,
+    seed: int,
+    base_name: str,
+    output_dir: str,
+    n_samples: Optional[int] = None,
+    post_process_method: str = "knn",
+    knn_neighbors: int = 5,
+    distance_metric: str = "hamming",
+    fallback: str = "weighted",
+    force_generate: bool = False,
+) -> dict:
+    """
+    Generate synthetic data from a trained synthcity model.
+
+    synthcity models output encoded data directly, which is reverse-
+    transformed to decoded (dual pipeline). Only library="synthcity" is
+    implemented (this repo's locked scope).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    encoded_path = output_dir / f"synthetic_{base_name}_encoded.csv"
+    decoded_path = output_dir / f"synthetic_{base_name}_decoded.csv"
+    metrics_path = output_dir / f"metrics_generation_{base_name}.json"
+
+    if not force_generate and decoded_path.exists():
+        print(f"Reusing existing synthetic data: {decoded_path}")
+        return {
+            "encoded_path": str(encoded_path),
+            "decoded_path": str(decoded_path),
+            "metrics_path": str(metrics_path),
+            "n_samples": len(pd.read_csv(decoded_path)),
+            "base_name": base_name,
+        }
+
+    if library != "synthcity":
+        raise ValueError(f"Unsupported library: {library!r} (only 'synthcity' is implemented)")
+
+    np.random.seed(seed)
+    random.seed(seed)
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+    print(f"Loading model: {model_path}")
+    model, _model_meta = load_model(model_path)
+
+    encoder = RDTDatasetEncoder.load(training_encoder_path)
+    training_data = load_csv_with_metadata(Path(training_file), Path(metadata_file))
+    print(f"Training data loaded: {training_data.shape}")
+
+    n_samples_config = n_samples
+    if n_samples is None:
+        reference_data = load_csv_with_metadata(Path(reference_file), Path(metadata_file))
+        n_samples = len(reference_data)
+        print(f"Auto n_samples from reference dataset: {n_samples}")
+    print(f"Generating {n_samples} samples ({library} {model_type}) ...")
+
+    start_time = time.time()
+    synthetic_encoded = model.generate(count=n_samples).dataframe()
+    generation_time = round(time.time() - start_time, 2)
+    print(f"Generated {len(synthetic_encoded)} samples in {generation_time}s")
+
+    if len(synthetic_encoded) == 0:
+        raise ValueError("Generated dataset is empty")
+
+    # Column validation
+    expected_cols = pd.read_csv(encoded_training_path, nrows=0).columns.tolist()
+    missing = set(expected_cols) - set(synthetic_encoded.columns)
+    if missing:
+        raise ValueError(
+            f"Synthcity {model_type} generated incomplete data: "
+            f"missing {len(missing)} columns: {sorted(missing)}"
+        )
+
+    synthetic_decoded = encoder.reverse_transform(synthetic_encoded)
+    synthetic_decoded, fix_metrics = apply_post_processing(
+        synthetic_decoded,
+        training_data,
+        encoder.sdtypes,
+        method=post_process_method,
+        knn_neighbors=knn_neighbors,
+        distance_metric=distance_metric,
+        fallback=fallback,
+    )
+
+    print(f"Encoded shape : {synthetic_encoded.shape}")
+    print(f"Decoded shape : {synthetic_decoded.shape}")
+
+    synthetic_encoded.to_csv(encoded_path, index=False)
+    synthetic_decoded.to_csv(decoded_path, index=False)
+    print(f"Saved encoded  → {encoded_path}")
+    print(f"Saved decoded  → {decoded_path}")
+
+    metrics = {
+        "seed": seed,
+        "library": library,
+        "model_type": model_type,
+        "timestamp": datetime.now().isoformat(),
+        "n_samples_config": n_samples_config,
+        "n_samples_auto_determined": n_samples_config is None,
+        "samples_generated": len(synthetic_decoded),
+        "samples_requested": n_samples,
+        "generation_time_seconds": generation_time,
+        "post_processing": {"fix_metrics": fix_metrics} if fix_metrics else {},
+        "outputs": {"encoded": str(encoded_path), "decoded": str(decoded_path)},
+    }
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Saved metrics  → {metrics_path}")
+
+    return {
+        "encoded_path": str(encoded_path),
+        "decoded_path": str(decoded_path),
+        "metrics_path": str(metrics_path),
+        "n_samples": len(synthetic_decoded),
+        "base_name": base_name,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Flow (encode + train checkpoint — generate_synthetic added next)
+# Flow — full encode → train → generate chain
 # ---------------------------------------------------------------------------
 
 @flow(name="sdg-pipeline")
@@ -308,9 +445,22 @@ def sdg_pipeline(
     library: str = "synthcity",
     seed: int = 42,
     parameters: dict | None = None,
+    reference_file: Optional[str] = None,
+    n_samples: Optional[int] = None,
+    post_process_method: str = "knn",
+    knn_neighbors: int = 5,
+    distance_metric: str = "hamming",
+    fallback: str = "weighted",
+    force_generate: bool = False,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
+    # Production configs set reference_file == training_file (confirmed in
+    # params_step7_pf_pilgram.yaml) — defaulting here matches real behavior,
+    # not a shortcut.
+    if reference_file is None:
+        reference_file = training_file
+
     run_params = {
         "training_file": training_file,
         "population_file": population_file,
@@ -320,6 +470,12 @@ def sdg_pipeline(
         "library": library,
         "seed": seed,
         "parameters": parameters,
+        "reference_file": reference_file,
+        "n_samples": n_samples,
+        "post_process_method": post_process_method,
+        "knn_neighbors": knn_neighbors,
+        "distance_metric": distance_metric,
+        "fallback": fallback,
     }
 
     fit_out = fit_encoder(
@@ -350,7 +506,32 @@ def sdg_pipeline(
         output_dir=output_dir,
     )
 
-    return {"fit_encoder": fit_out, "encode_data": encode_out, "train_sdg": train_out}
+    generate_out = generate_synthetic(
+        model_path=train_out["model_path"],
+        training_encoder_path=encode_out["training_encoder"],
+        training_file=training_file,
+        metadata_file=metadata_file,
+        reference_file=reference_file,
+        encoded_training_path=encode_out["encoded_training"],
+        model_type=model_type,
+        library=library,
+        seed=seed,
+        base_name=base_name,
+        output_dir=output_dir,
+        n_samples=n_samples,
+        post_process_method=post_process_method,
+        knn_neighbors=knn_neighbors,
+        distance_metric=distance_metric,
+        fallback=fallback,
+        force_generate=force_generate,
+    )
+
+    return {
+        "fit_encoder": fit_out,
+        "encode_data": encode_out,
+        "train_sdg": train_out,
+        "generate_synthetic": generate_out,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +551,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--library", default="synthcity", help="Generator library (only 'synthcity' is implemented; kept as a real seam for future libraries)")
     parser.add_argument("--seed", type=int, default=42, help="Model seed")
     parser.add_argument("--params", default="{}", help="Inline JSON string of model hyperparameter overrides")
+    parser.add_argument("--reference-file", default=None, help="Reference CSV for auto-sizing --n-samples (default: same as --training-file, matching production configs)")
+    parser.add_argument("--n-samples", type=int, default=None, help="Number of synthetic rows to generate (default: auto-size from --reference-file)")
+    parser.add_argument("--post-process-method", default="knn", choices=["knn", "weighted", "random", "none"], help="Invalid-category fixing method ('none' disables post-processing)")
+    parser.add_argument("--knn-neighbors", type=int, default=5, help="Neighbors for the 'knn' post-process method")
+    parser.add_argument("--distance-metric", default="hamming", help="Distance metric for the 'knn' post-process method")
+    parser.add_argument("--fallback", default="weighted", choices=["knn", "weighted", "random"], help="Fallback method when a column is 100% invalid")
+    parser.add_argument("--force-generate", action="store_true", help="Regenerate synthetic data even if cached output exists")
     parser.add_argument("--encoder-dir", default="outputs/sdg_runs/encoders", help="Shared population-encoder cache dir")
     parser.add_argument("--output-dir", default="outputs/sdg_runs", help="Per-run output directory")
     return parser.parse_args()
@@ -388,6 +576,13 @@ if __name__ == "__main__":
         library=args.library,
         seed=args.seed,
         parameters=parameters,
+        reference_file=args.reference_file,
+        n_samples=args.n_samples,
+        post_process_method=args.post_process_method,
+        knn_neighbors=args.knn_neighbors,
+        distance_metric=args.distance_metric,
+        fallback=args.fallback,
+        force_generate=args.force_generate,
         encoder_dir=args.encoder_dir,
         output_dir=args.output_dir,
     )
