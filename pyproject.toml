@@ -24,6 +24,13 @@ dependencies = [
     "fastapi==0.135.2",
     "starlette==1.0.0",
     "pydantic==2.12.5",
+    # Step 4 — encode stage (RDT dataset encoding), pinned exact
+    "rdt==1.18.2",
+    # rdt's own transitive deps that drifted from sdpype's exact versions —
+    # scipy matters because rdt's UniformEncoder/FloatFormatter use
+    # scipy.stats internally, directly in the byte-exact-verified encode path
+    "scipy==1.13.1",
+    "Faker==38.2.0",
 ]
 
 [build-system]
