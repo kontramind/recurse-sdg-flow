@@ -20,8 +20,8 @@ privacy_evaluation, detection_evaluation, statistical_similarity
 (table_structure, semantic_structure, boundary_adherence,
 category_adherence, alpha_precision, prdc_score, the three
 jensenshannon_* variants, maximum_mean_discrepancy (corrected),
-ks_complement, tv_complement so far; the remaining statistical sub-metrics
-are added one per commit).
+new_row_synthesis, ks_complement, tv_complement so far; the remaining
+statistical sub-metrics are added one per commit).
 
 Usage:
     python flows/sdg_flow.py \\
@@ -1228,6 +1228,9 @@ def sdg_pipeline(
             # the metric falls back to a per-run median-heuristic gamma; a
             # --config run passes the frozen per-variant value.
             {"name": "maximum_mean_discrepancy", "parameters": {"kernel": "rbf", "gamma": None}},
+            # synthetic_sample_size stays None — that is what produced the sd-lake
+            # ground truth (and it is ~67s/model at that setting).
+            {"name": "new_row_synthesis", "parameters": {"numerical_match_tolerance": 0.01, "synthetic_sample_size": None}},
             {"name": "ks_complement", "parameters": {"target_columns": None}},
             {"name": "tv_complement", "parameters": {"target_columns": None}},
         ]

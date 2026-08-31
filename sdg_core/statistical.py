@@ -26,6 +26,8 @@ one metric at a time (the port is being built incrementally); each
     module-level `from nannyml...` import in sdpype is dead code and is NOT carried)
   maximum_mean_discrepancy -> MaximumMeanDiscrepancyMetric  (corrected MMD, NOT synthcity's
     — see the module docstring)
+  new_row_synthesis  -> NewRowSynthesisMetric  (sdmetrics.single_table.NewRowSynthesis
+    compute_breakdown; synthetic_sample_size stays null — what made the ground truth)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -66,6 +68,7 @@ from sdmetrics.single_column import (
     TVComplement,
 )
 from sdmetrics.single_table import TableStructure
+from sdmetrics.single_table.new_row_synthesis import NewRowSynthesis
 from sklearn.metrics.pairwise import euclidean_distances, rbf_kernel
 from syndat.metrics import jensen_shannon_distance as syndat_jsd
 from synthcity.metrics.eval_statistical import (
@@ -1432,6 +1435,51 @@ class MaximumMeanDiscrepancyMetric:
             }
 
 
+class NewRowSynthesisMetric:
+    """NewRowSynthesis metric implementation"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        self.numerical_match_tolerance = parameters.get("numerical_match_tolerance", 0.01)
+        self.synthetic_sample_size = parameters.get("synthetic_sample_size", None)
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate NewRowSynthesis metric"""
+        start_time = time.time()
+
+        try:
+            # Convert the SingleTableMetadata object to a dictionary as required by SDMetrics
+            metadata_dict = metadata.to_dict()
+
+            # Run evaluation using SDMetrics
+            result = NewRowSynthesis.compute_breakdown(
+                real_data=original,
+                synthetic_data=synthetic,
+                metadata=metadata_dict,
+                numerical_match_tolerance=self.numerical_match_tolerance,
+                synthetic_sample_size=self.synthetic_sample_size
+            )
+
+            return {
+                "score": float(result.get("score", 0.0)),
+                "num_new_rows": int(result.get("num_new_rows", 0)),
+                "num_matched_rows": int(result.get("num_matched_rows", 0)),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "score": 0.0,
+                "num_new_rows": 0,
+                "num_matched_rows": len(synthetic) if synthetic is not None else 0,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
 # ===========================================================================
 # Dispatch
 # ===========================================================================
@@ -1584,6 +1632,8 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return JensenShannonNannyMLMetric(**parameters)
         case "maximum_mean_discrepancy":
             return MaximumMeanDiscrepancyMetric(**parameters)
+        case "new_row_synthesis":
+            return NewRowSynthesisMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 
