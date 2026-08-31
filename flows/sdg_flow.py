@@ -11,17 +11,18 @@ by argparse (no Hydra/YAML template resolution); fit_encoder, encode_data,
 train_sdg and generate_synthetic are the core encode → train → generate
 chain (arf/ctgan/ddpm/rtvae/nflow, synthcity-only).
 
-The evaluation stages from sdpype's own "# Evaluation tasks" marker onward
-(encode_evaluation, then statistical / privacy / detection / hallucination /
-TSTR + report) are being ported incrementally, one stage per commit, each
-verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
-encode_evaluation, hallucination_evaluation, tstr_evaluation,
+All of sdpype's evaluation stages (from its own "# Evaluation tasks" marker
+onward) are ported and wired, each verified against real gen-0 artifacts in
+../sd-lake/: encode_evaluation, hallucination_evaluation, tstr_evaluation,
 privacy_evaluation, detection_evaluation, statistical_similarity
 (table_structure, semantic_structure, boundary_adherence,
 category_adherence, alpha_precision, prdc_score, the three
 jensenshannon_* variants, maximum_mean_discrepancy (corrected),
 new_row_synthesis, wasserstein_distance, ks_complement, tv_complement,
-sdmetrics_quality — all 15 statistical sub-metrics now ported).
+sdmetrics_quality — all 15 statistical sub-metrics), and report_task
+(sdpype's rich console panels, verbatim, + a per-stage timing summary
+added on top). The report prints after the eval stages unless report=False
+/ --no-report.
 
 Usage:
     python flows/sdg_flow.py \\
@@ -47,6 +48,7 @@ import pandas as pd
 import torch
 import yaml
 from prefect import flow, task
+from rich.console import Console as RichConsole
 from sdv.metadata import SingleTableMetadata
 
 from flows.lgbm_cv_flow import encode_features, evaluate_on_test, train_final_model
@@ -1146,6 +1148,641 @@ def statistical_similarity(
 
 
 # ---------------------------------------------------------------------------
+# Rich console report
+# ---------------------------------------------------------------------------
+#
+# _display_statistical_tables / _display_privacy_panel / _display_detection_panel
+# / _display_hallucination_panel / _display_tstr_panel / report_task are ported
+# VERBATIM from sdpype flows/sdg_flow.py (the working tree). Only adaptation:
+# report_task's signature takes the port's stage-output names and an optional
+# base_name, and it ends by calling _display_timing_panel — the one thing added
+# on top of sdpype: a consolidated per-stage wall-time summary read back from
+# each stage's own metrics JSON. (sdpype's dead cross-module imports
+# _display_hallucination_results / _display_privacy_tables / _display_detection_tables
+# and the unused RichPanel are not carried.)
+
+
+def _display_statistical_tables(results: dict) -> None:
+    """
+    Display statistical similarity metrics as Rich tables inside a Panel.
+
+    Mirrors the table structure from sdpype/evaluate.py main() exactly,
+    but wraps all tables in a Panel using rich.console.Group.
+    No reference_data DataFrame needed — uses column_scores keys directly.
+    """
+    from rich.console import Console as _C, Group as _Group
+    from rich.table import Table as _T
+    from rich.panel import Panel as _P
+    from rich import box as _box
+
+    console = _C()
+    metrics = results.get("metrics", {})
+    tables = []   # collect all renderables → wrap in Panel at the end
+
+    STATUS_DISPLAY = {
+        "match": "✓ Match",
+        "dtype_mismatch": "⚠ Dtype mismatch",
+        "sdtype_mismatch": "⚠ Sdtype mismatch",
+        "missing_in_synthetic": "✗ Missing in synth",
+        "only_in_synthetic": "⚠ Only in synth",
+    }
+    STATUS_COLORS = {
+        "match": "bright_green",
+        "dtype_mismatch": "yellow",
+        "sdtype_mismatch": "yellow",
+        "missing_in_synthetic": "red",
+        "only_in_synthetic": "yellow",
+    }
+
+    def _col_table(title, score_col_label, result, col_key="column_scores"):
+        """Generic per-column score table (Boundary/Category/KS/TV pattern)."""
+        params = result.get("parameters", {})
+        target = (params or {}).get("target_columns", None)
+        t = _T(title=f"✅ {title} (target_columns={target})",
+               show_header=True, header_style="bold blue")
+        t.add_column("Column", style="cyan", no_wrap=True)
+        t.add_column(score_col_label, style="bright_green", justify="right")
+        t.add_column("Status", style="yellow", justify="center")
+        agg = result.get("aggregate_score")
+        t.add_row("AGGREGATE", f"{agg:.3f}" if agg is not None else "n/a", "✓")
+        t.add_section()
+        col_scores = result.get(col_key, {})
+        compatible = result.get("compatible_columns", [])
+        for col in sorted(set(list(col_scores.keys()) + list(compatible))):
+            if col in col_scores:
+                t.add_row(col, f"{col_scores[col]:.3f}", "✓")
+            else:
+                t.add_row(col, "error", "⚠️")
+        if result.get("message"):
+            t.add_section()
+            t.add_row("INFO", result["message"], "ℹ️")
+        return t
+
+    # ------------------------------------------------------------------
+    # TableStructure
+    # ------------------------------------------------------------------
+    if "table_structure" in metrics and metrics["table_structure"]["status"] == "success":
+        v = metrics["table_structure"]
+        params_display = str(v["parameters"]) if v["parameters"] else "no parameters"
+        t = _T(title=f"✅ TableStructure Results ({params_display})",
+               show_header=True, header_style="bold blue")
+        t.add_column("Metric", style="cyan", no_wrap=True)
+        t.add_column("Value", style="bright_green", justify="right")
+        t.add_row("Overall Score", f"{v['score']:.3f}")
+        if "summary" in v:
+            su = v["summary"]
+            t.add_row("Matching Columns", str(su["matching_columns"]))
+            t.add_row("Dtype Mismatches", str(su["dtype_mismatches"]))
+            t.add_row("Missing in Synthetic", str(su["missing_in_synthetic"]))
+            t.add_row("Only in Synthetic", str(su["only_in_synthetic"]))
+        tables.append(t)
+        if v.get("comparison_table"):
+            ct = _T(title="Column-by-Column Comparison",
+                    show_header=True, header_style="bold blue", show_lines=False)
+            ct.add_column("Column", style="cyan")
+            ct.add_column("Real dtype", style="green")
+            ct.add_column("Synthetic dtype", style="magenta")
+            ct.add_column("Status", style="white")
+            for item in v["comparison_table"]:
+                clr = STATUS_COLORS.get(item["status"], "white")
+                ct.add_row(item["column"],
+                           str(item.get("real_dtype") or "-"),
+                           str(item.get("synthetic_dtype") or "-"),
+                           f"[{clr}]{STATUS_DISPLAY.get(item['status'], item['status'])}[/{clr}]")
+            tables.append(ct)
+
+    # ------------------------------------------------------------------
+    # SemanticStructure
+    # ------------------------------------------------------------------
+    if "semantic_structure" in metrics and metrics["semantic_structure"]["status"] == "success":
+        v = metrics["semantic_structure"]
+        params_display = str(v["parameters"]) if v["parameters"] else "no parameters"
+        t = _T(title=f"✅ SemanticStructure Results ({params_display})",
+               show_header=True, header_style="bold blue")
+        t.add_column("Metric", style="cyan", no_wrap=True)
+        t.add_column("Value", style="bright_green", justify="right")
+        t.add_row("Overall Score", f"{v['score']:.3f}")
+        if "summary" in v:
+            su = v["summary"]
+            t.add_row("Matching Columns", str(su["matching_columns"]))
+            t.add_row("Sdtype Mismatches", str(su["sdtype_mismatches"]))
+            t.add_row("Missing in Synthetic", str(su["missing_in_synthetic"]))
+            t.add_row("Only in Synthetic", str(su["only_in_synthetic"]))
+        tables.append(t)
+        if v.get("comparison_table"):
+            ct = _T(title="Column-by-Column Comparison (Semantic Types)",
+                    show_header=True, header_style="bold blue", show_lines=False)
+            ct.add_column("Column", style="cyan")
+            ct.add_column("Real sdtype", style="green")
+            ct.add_column("Synthetic sdtype", style="magenta")
+            ct.add_column("Status", style="white")
+            for item in v["comparison_table"]:
+                clr = STATUS_COLORS.get(item["status"], "white")
+                ct.add_row(item["column"],
+                           str(item.get("real_sdtype") or "-"),
+                           str(item.get("synthetic_sdtype") or "-"),
+                           f"[{clr}]{STATUS_DISPLAY.get(item['status'], item['status'])}[/{clr}]")
+            tables.append(ct)
+
+    # ------------------------------------------------------------------
+    # NewRowSynthesis
+    # ------------------------------------------------------------------
+    if "new_row_synthesis" in metrics and metrics["new_row_synthesis"]["status"] == "success":
+        v = metrics["new_row_synthesis"]
+        p = v.get("parameters", {}) or {}
+        params_display = f"tolerance={p.get('numerical_match_tolerance', 0.01)}, sample_size={p.get('synthetic_sample_size', 'all rows')}"
+        t = _T(title=f"✅ NewRowSynthesis Results ({params_display})",
+               show_header=True, header_style="bold blue")
+        t.add_column("Metric", style="cyan", no_wrap=True)
+        t.add_column("Value", style="bright_green", justify="right")
+        t.add_row("New Row Score", f"{v['score']:.3f}")
+        t.add_row("New Rows", f"{v['num_new_rows']:,}")
+        t.add_row("Matched Rows", f"{v['num_matched_rows']:,}")
+        tables.append(t)
+
+    # ------------------------------------------------------------------
+    # BoundaryAdherence / CategoryAdherence / KSComplement / TVComplement
+    # ------------------------------------------------------------------
+    for key, title, label in [
+        ("boundary_adherence",  "BoundaryAdherence",  "Boundary Score"),
+        ("category_adherence",  "CategoryAdherence",  "Category Score"),
+        ("ks_complement",       "KSComplement",        "KS Score"),
+        ("tv_complement",       "TVComplement",        "TV Score"),
+    ]:
+        if key in metrics and metrics[key]["status"] == "success":
+            tables.append(_col_table(title, label, metrics[key]))
+
+    # ------------------------------------------------------------------
+    # Alpha Precision
+    # ------------------------------------------------------------------
+    if "alpha_precision" in metrics and metrics["alpha_precision"]["status"] == "success":
+        v = metrics["alpha_precision"]
+        sc = v["scores"]
+        params_display = str(v["parameters"]) if v["parameters"] else "default settings"
+        t = _T(title=f"✅ Alpha Precision Results ({params_display})",
+               show_header=True, header_style="bold magenta")
+        t.add_column("Metric", style="cyan", no_wrap=True)
+        t.add_column("OC Variant", style="green", justify="right")
+        t.add_column("Naive Variant", style="yellow", justify="right")
+        t.add_row("Delta Precision Alpha",
+                  f"{sc['delta_precision_alpha_OC']:.3f}",
+                  f"{sc['delta_precision_alpha_naive']:.3f}")
+        t.add_row("Delta Coverage Beta",
+                  f"{sc['delta_coverage_beta_OC']:.3f}",
+                  f"{sc['delta_coverage_beta_naive']:.3f}")
+        t.add_row("Authenticity",
+                  f"{sc['authenticity_OC']:.3f}",
+                  f"{sc['authenticity_naive']:.3f}")
+        tables.append(t)
+
+    # ------------------------------------------------------------------
+    # PRDC
+    # ------------------------------------------------------------------
+    if "prdc_score" in metrics and metrics["prdc_score"]["status"] == "success":
+        v = metrics["prdc_score"]
+        params_display = str(v["parameters"]) if v["parameters"] else "default settings"
+        t = _T(title=f"✅ PRDC Score Results ({params_display})",
+               show_header=True, header_style="bold blue")
+        t.add_column("Metric", style="cyan", no_wrap=True)
+        t.add_column("Score", style="bright_green", justify="right")
+        t.add_row("Precision", f"{v['precision']:.3f}")
+        t.add_row("Recall",    f"{v['recall']:.3f}")
+        t.add_row("Density",   f"{v['density']:.3f}")
+        t.add_row("Coverage",  f"{v['coverage']:.3f}")
+        tables.append(t)
+
+    # ------------------------------------------------------------------
+    # Distance metrics: Wasserstein, MMD, JS × 3
+    # ------------------------------------------------------------------
+    DIST_META = {
+        "wasserstein_distance":    ("Wasserstein Distance",               "joint_distance", None),
+        "maximum_mean_discrepancy":("Maximum Mean Discrepancy",           "joint_distance", "kernel"),
+        "jensenshannon_synthcity": ("Jensen-Shannon Distance (Synthcity)","distance_score", None),
+        "jensenshannon_syndat":    ("Jensen-Shannon Distance (SYNDAT)",   "distance_score", None),
+        "jensenshannon_nannyml":   ("Jensen-Shannon Distance (NannyML)",  "distance_score", None),
+    }
+    DIST_THRESHOLDS = [(0.01, "Identical"), (0.05, "Very Similar"), (0.1, "Similar")]
+
+    def _interp(d):
+        for thresh, label in DIST_THRESHOLDS:
+            if d < thresh:
+                return label
+        return "Different"
+
+    for key, (label, dist_field, param_field) in DIST_META.items():
+        if key not in metrics or metrics[key]["status"] != "success":
+            continue
+        v = metrics[key]
+        if param_field:
+            params_display = f"{param_field}={v.get(param_field, '?')}"
+        else:
+            params_display = str(v.get("parameters") or "default settings")
+        t = _T(title=f"✅ {label} Results ({params_display})",
+               show_header=True, header_style="bold blue")
+        t.add_column("Metric", style="cyan", no_wrap=True)
+        t.add_column("Score", style="bright_green", justify="right")
+        t.add_column("Interpretation", style="yellow")
+        dist = v[dist_field]
+        t.add_row("Joint Distance", f"{dist:.6f}", _interp(dist))
+        t.add_row("", "", "Lower is better")
+        tables.append(t)
+
+    # ------------------------------------------------------------------
+    # SDMetrics Quality
+    # ------------------------------------------------------------------
+    if "sdmetrics_quality" in metrics and metrics["sdmetrics_quality"]["status"] == "success":
+        v = metrics["sdmetrics_quality"]
+        ps = v.get("property_scores", {})
+        overall = v.get("score", 0.0)
+
+        def _sq_color(s):
+            if s >= 0.8: return "green"
+            if s >= 0.6: return "yellow"
+            return "red"
+
+        # Scores table
+        scores_t = _T(title="✅ SDMetrics Quality Report",
+                      show_header=True, header_style="bold cyan")
+        scores_t.add_column("Property", style="dim white")
+        scores_t.add_column("Score", justify="center")
+        for prop_name, prop_key in [("Column Shapes", "column_shapes"),
+                                     ("Column Pair Trends", "column_pair_trends")]:
+            if prop_key in ps:
+                c = _sq_color(ps[prop_key])
+                scores_t.add_row(prop_name, f"[{c}]{ps[prop_key]:.2%}[/{c}]")
+        c = _sq_color(overall)
+        scores_t.add_row("[bold]Overall Quality Score[/bold]",
+                         f"[bold {c}]{overall:.2%}[/bold {c}]")
+        tables.append(scores_t)
+
+        # Column shapes details
+        shapes_details = v.get("column_shapes_details", [])
+        if shapes_details:
+            sd_t = _T(title="Column Shapes Details (Distribution Similarity)",
+                      show_header=True, header_style="bold cyan")
+            sd_t.add_column("Column", style="dim white", width=25)
+            sd_t.add_column("Metric", style="magenta", width=15)
+            sd_t.add_column("Score", justify="center", width=12)
+            sd_t.add_column("Interpretation", style="dim", width=45)
+            for detail in shapes_details:
+                score = detail.get("Score")
+                if score is None:
+                    interp, color = "Insufficient data", "dim"
+                elif score >= 0.9: interp, color = "Excellent", "green"
+                elif score >= 0.8: interp, color = "Good", "green"
+                elif score >= 0.7: interp, color = "Acceptable", "yellow"
+                elif score >= 0.5: interp, color = "Poor", "yellow"
+                else:              interp, color = "Very poor", "red"
+                sd_t.add_row(
+                    detail.get("Column", ""),
+                    detail.get("Metric", ""),
+                    f"[{color}]{score:.3f}[/{color}]" if score is not None else "[dim]N/A[/dim]",
+                    interp,
+                )
+            tables.append(sd_t)
+
+    # ------------------------------------------------------------------
+    # Wrap all tables in a single Panel
+    # ------------------------------------------------------------------
+    console.print(_P(_Group(*tables), title="📊 Statistical Similarity", border_style="blue"))
+
+
+def _display_privacy_panel(results: dict) -> None:
+    """Display privacy metrics tables inside a Panel."""
+    from rich.console import Console as _C, Group as _Group
+    from rich.table import Table as _T
+    from rich.panel import Panel as _P
+
+    console = _C()
+    metrics = results.get("metrics", {})
+    tables = []
+
+    # DCR Baseline Protection
+    dcr = metrics.get("dcr_baseline_protection", {})
+    if dcr:
+        t = _T(title="DCR Baseline Protection", show_header=True, header_style="bold blue")
+        t.add_column("Metric", style="cyan", no_wrap=True)
+        t.add_column("Score", style="bright_green", justify="right")
+        t.add_column("Interpretation", style="yellow")
+        if dcr.get("status") == "success":
+            score = dcr.get("score", 0.0)
+            interp = "Excellent" if score > 0.8 else "Good" if score > 0.6 else "Moderate" if score > 0.4 else "Poor"
+            t.add_row("Privacy Score", f"{score:.3f}", interp)
+            t.add_row("Median DCR (Synthetic)", f"{dcr.get('median_dcr_synthetic', 0):.6f}", "")
+            t.add_row("Median DCR (Random)",    f"{dcr.get('median_dcr_random', 0):.6f}", "Higher is better")
+        else:
+            t.add_row("DCR Baseline Protection", "N/A", f"❌ {dcr.get('error_message', 'Error')[:50]}")
+        tables.append(t)
+
+    # K-Anonymization
+    kanon = metrics.get("k_anonymization", {})
+    if kanon and kanon.get("status") == "success":
+        k_values = kanon.get("k_values", {})
+        if k_values:
+            t = _T(title="K-Anonymity Values", show_header=True, header_style="bold blue")
+            t.add_column("Dataset", style="cyan", no_wrap=True)
+            t.add_column("k-anonymity", justify="right")
+            t.add_column("Interpretation", style="yellow")
+            for ds in ["population", "reference", "training", "synthetic"]:
+                if ds in k_values:
+                    kd = k_values[ds]
+                    interp = kd.get("interpretation", "")
+                    color = "green" if interp == "Excellent" else "yellow" if interp == "Good" else "red"
+                    t.add_row(ds.capitalize(), f"[{color}]{kd['k']}[/{color}]", interp)
+            tables.append(t)
+
+        k_ratios = kanon.get("k_ratios", {})
+        if k_ratios:
+            t = _T(title="K-Anonymity Ratios", show_header=True, header_style="bold blue")
+            t.add_column("Comparison", style="cyan")
+            t.add_column("Ratio", justify="right")
+            t.add_column("Interpretation", style="yellow")
+            for label, rd in k_ratios.items():
+                ratio = rd["ratio"]
+                color = "green" if ratio > 1.0 else "red" if ratio < 0.9 else "yellow"
+                t.add_row(label, f"[{color}]{ratio:.4f}[/{color}]", rd.get("interpretation", ""))
+            tables.append(t)
+
+    if not tables:
+        console.print("[dim]No privacy metrics results[/dim]")
+        return
+    console.print(_P(_Group(*tables), title="🔒 Privacy Evaluation", border_style="cyan"))
+
+
+def _display_detection_panel(results: dict) -> None:
+    """Display detection evaluation tables inside a Panel."""
+    from rich.console import Console as _C, Group as _Group
+    from rich.table import Table as _T
+    from rich.panel import Panel as _P
+
+    console = _C()
+    individual = results.get("individual_scores", {})
+    tables = []
+
+    t = _T(title="Synthcity Detection Performance", show_header=True, header_style="bold blue")
+    t.add_column("Method", style="cyan", no_wrap=True)
+    t.add_column("AUC Score", style="bright_green", justify="right")
+    t.add_column("Quality Assessment", style="yellow")
+    t.add_column("Status", style="green")
+
+    for method, result in individual.items():
+        method_display = method.replace("_", " ").title()
+        if result.get("status") == "success":
+            auc = result["auc_score"]
+            if auc <= 0.55:   quality = "🟢 Excellent"
+            elif auc <= 0.65: quality = "🟡 Good"
+            elif auc <= 0.75: quality = "🟠 Fair"
+            else:             quality = "🔴 Poor"
+            t.add_row(method_display, f"{auc:.3f}", quality, "✅ Success")
+        else:
+            t.add_row(method_display, "N/A", "❌ Failed",
+                      f"{result.get('error_message', 'Error')[:40]}")
+    tables.append(t)
+
+    ensemble = results.get("ensemble_score")
+    if ensemble is not None:
+        et = _T(title="Ensemble Score", show_header=True, header_style="bold blue")
+        et.add_column("Metric", style="cyan")
+        et.add_column("Value", style="bright_green", justify="right")
+        et.add_row("Mean AUC (all methods)", f"{ensemble:.3f}")
+        et.add_row("Note", "AUC ≤ 0.55 = indistinguishable from real")
+        tables.append(et)
+
+    console.print(_P(_Group(*tables), title="🔍 Detection Evaluation", border_style="magenta"))
+
+
+def _display_hallucination_panel(results: dict) -> None:
+    """Display hallucination metrics tables inside a Panel."""
+    from rich.console import Console as _C, Group as _Group
+    from rich.table import Table as _T
+    from rich.panel import Panel as _P
+    from rich import box as _box
+
+    console = _C()
+    ds = results.get("dataset_statistics", {})
+    m = results.get("metrics", {})
+    num_bins = results.get("binning", {}).get("num_bins", 20)
+    tables = []
+
+    # Dataset statistics
+    stats = _T(title="Dataset Statistics", show_header=True,
+               header_style="bold cyan", box=_box.ROUNDED)
+    stats.add_column("Dataset", style="cyan")
+    stats.add_column("Rows", justify="right")
+    stats.add_column("Columns", justify="right")
+    for name in ["population", "training", "synthetic"]:
+        d = ds.get(name, {})
+        stats.add_row(name.capitalize(), f"{d.get('rows', 0):,}", str(d.get("columns", 0)))
+    tables.append(stats)
+
+    # Metrics
+    metrics_t = _T(title=f"Hallucination Metrics  (num_bins={num_bins})",
+                   show_header=True, header_style="bold magenta", box=_box.DOUBLE_EDGE)
+    metrics_t.add_column("Metric", style="cyan", width=34)
+    metrics_t.add_column("Count", justify="right", width=12)
+    metrics_t.add_column("Rate", justify="right", width=10)
+    metrics_t.add_column("Interpretation", style="dim", width=38)
+
+    for key, label, interp, style in [
+        ("TotalFR",     "Total Factuality Rate (TotalFR)",         "In population (Novel + Memorized)", "green"),
+        ("NovelFR",     "  Novel Factuality (NovelFR)",            "In population, NOT in training ✨",  "bold green"),
+        ("MemorizedFR", "  Memorized Factuality (MemorizedFR)",    "In population AND in training",      "yellow"),
+        ("HR",          "Hallucination Rate (HR)",                 "NOT in population",                 "red"),
+    ]:
+        if key in m:
+            v = m[key]
+            metrics_t.add_row(label, f"{v['count']:,}", f"{v['rate_pct']:.2f}%", interp, style=style)
+
+    total = m.get("total_records", 0)
+    metrics_t.add_row("[bold]Total[/bold]", f"{total:,}", "100.00%", "TotalFR + HR = 100%", style="bold")
+    tables.append(metrics_t)
+
+    console.print(_P(_Group(*tables), title="🎯 Hallucination Evaluation", border_style="green"))
+
+
+def _display_tstr_panel(tstr_out: dict) -> None:
+    """Display TRTR vs TSTR side-by-side comparison table inside a Panel."""
+    from rich.console import Console as _C, Group as _Group
+    from rich.table import Table as _T
+    from rich.panel import Panel as _P
+    from rich import box as _box
+
+    if tstr_out.get("status") == "skipped":
+        _C().print(_P(
+            f"[yellow]{tstr_out.get('skip_reason', 'TSTR skipped')}[/yellow]",
+            title="⚡ TSTR — Utility Evaluation  [SKIPPED]",
+            border_style="yellow",
+        ))
+        return
+
+    console = _C()
+    trtr = tstr_out["trtr_metrics"]
+    tstr = tstr_out["tstr_metrics"]
+    gap = tstr_out["utility_gap"]
+
+    t = _T(
+        title=f"TRTR vs TSTR  "
+              f"([dim]{tstr_out['train_rows_synth']:,} synth train / "
+              f"{tstr_out['test_rows_real']:,} real test[/dim])",
+        show_header=True,
+        header_style="bold cyan",
+        box=_box.DOUBLE_EDGE,
+    )
+    t.add_column("Metric", style="cyan", width=14)
+    t.add_column("TRTR (real→real)", justify="right", width=18)
+    t.add_column("TSTR (synth→real)", justify="right", width=18)
+
+    for key, label in [
+        ("auroc",     "AUROC"),
+        ("f1_score",  "F1"),
+        ("precision", "Precision"),
+        ("recall",    "Recall"),
+        ("accuracy",  "Accuracy"),
+    ]:
+        t.add_row(label, f"{trtr[key]:.4f}", f"{tstr[key]:.4f}")
+
+    t.add_section()
+    if gap < 0.02:
+        gap_style, gap_label = "bold green", "✓ excellent"
+    elif gap < 0.05:
+        gap_style, gap_label = "bold yellow", "~ acceptable"
+    else:
+        gap_style, gap_label = "bold red", "✗ high loss"
+    t.add_row(
+        "Utility gap",
+        "",
+        f"[{gap_style}]{gap:+.4f}  {gap_label}[/{gap_style}]",
+    )
+
+    console.print(_P(_Group(t), title="⚡ TSTR — Utility Evaluation", border_style="cyan"))
+
+
+def _display_timing_panel(metrics_dir: Path, base_name: str) -> None:
+    """Consolidated per-stage wall time (added on top of sdpype's panels).
+
+    Best-effort: each stage's time is read back from its own metrics JSON in
+    the run's metrics/ dir. A stage whose JSON is missing or lacks a timing
+    field shows as "—". statistical_similarity has no single task-level timer
+    (neither here nor in sdpype), so its row is the sum of the per-metric
+    execution_time values.
+    """
+    from rich.console import Console as _C
+    from rich.table import Table as _T
+    from rich.panel import Panel as _P
+    from rich import box as _box
+
+    def _load(name: str) -> Optional[dict]:
+        p = metrics_dir / f"{name}_{base_name}.json"
+        if not p.exists():
+            return None
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _stat_total(d: Optional[dict]):
+        if not d:
+            return None
+        vals = [
+            m.get("execution_time")
+            for m in d.get("metrics", {}).values()
+            if isinstance(m, dict) and isinstance(m.get("execution_time"), (int, float))
+        ]
+        return sum(vals) if vals else None
+
+    encoding      = _load("encoding")
+    training      = _load("training")
+    generation    = _load("generation")
+    encoding_eval = _load("encoding_evaluation")
+    statistical   = _load("statistical_similarity")
+    privacy       = _load("privacy")
+    detection     = _load("detection_evaluation")
+    hallucination = _load("hallucination")
+    tstr          = _load("tstr")
+
+    rows = [
+        ("Encode data",            (encoding or {}).get("encoding_time_seconds")),
+        ("Train SDG",              (training or {}).get("training_time")),
+        ("Generate synthetic",     (generation or {}).get("generation_time_seconds")),
+        ("Encode (evaluation)",    (encoding_eval or {}).get("encoding_time_seconds")),
+        ("Statistical similarity", _stat_total(statistical)),
+        ("Privacy (k-anonymity)",  (privacy or {}).get("metrics", {}).get("k_anonymization", {}).get("execution_time")),
+        ("Detection",              (detection or {}).get("execution_time")),
+        ("Hallucination",          (hallucination or {}).get("execution_time")),
+        ("TSTR",                   (tstr or {}).get("execution_time")),
+    ]
+    total = sum(v for _, v in rows if isinstance(v, (int, float)))
+
+    t = _T(title="Per-stage wall time", show_header=True,
+           header_style="bold blue", box=_box.ROUNDED)
+    t.add_column("Stage", style="cyan", no_wrap=True)
+    t.add_column("Seconds", style="bright_green", justify="right")
+    t.add_column("% of total", style="yellow", justify="right")
+    for label, v in rows:
+        if isinstance(v, (int, float)):
+            pct = (v / total * 100) if total else 0.0
+            t.add_row(label, f"{v:,.2f}", f"{pct:.1f}%")
+        else:
+            t.add_row(label, "—", "—")
+    t.add_section()
+    t.add_row("[bold]Total[/bold]", f"[bold]{total:,.2f}[/bold]", "[bold]100.0%[/bold]")
+
+    _C().print(_P(t, title="⏱ Timing Summary", border_style="blue"))
+
+
+@task(name="report", log_prints=True)
+def report_task(
+    stat_out: dict,
+    priv_out: dict,
+    det_out: dict,
+    halluc_out: dict,
+    tstr_out: Optional[dict] = None,
+    base_name: Optional[str] = None,
+) -> None:
+    """
+    Print all evaluation results to stdout using Rich tables, then a
+    per-stage timing summary.
+
+    Ported from sdpype flows/sdg_flow.py::report_task — same JSON-reading and
+    status=skipped guarding. Adaptations: the stage-output args carry the
+    port's names; base_name (+ the metrics/ dir of stat_out) locates every
+    stage's JSON for the added _display_timing_panel.
+    """
+    console = RichConsole()
+
+    def _load(path: str) -> dict:
+        with open(path) as f:
+            return json.load(f)
+
+    def _is_skipped(data: dict) -> bool:
+        return data.get("metadata", {}).get("status") == "skipped"
+
+    stat_data   = _load(stat_out["metrics_path"])
+    priv_data   = _load(priv_out["metrics_path"])
+    det_data    = _load(det_out["metrics_path"])
+    halluc_data = _load(halluc_out["metrics_path"])
+
+    if not _is_skipped(stat_data):
+        _display_statistical_tables(stat_data)
+    if not _is_skipped(priv_data):
+        _display_privacy_panel(priv_data)
+    if not _is_skipped(det_data):
+        _display_detection_panel(det_data)
+    if not _is_skipped(halluc_data):
+        _display_hallucination_panel(halluc_data)
+    if tstr_out is not None:
+        _display_tstr_panel(tstr_out)
+
+    if base_name:
+        _display_timing_panel(Path(stat_out["metrics_path"]).parent, base_name)
+
+    console.print()
+    console.rule("[bold green]Pipeline Complete[/bold green]")
+    console.print()
+
+
+# ---------------------------------------------------------------------------
 # Flow — encode → train → generate → evaluation-encode → hallucination → TSTR → privacy → detection
 # ---------------------------------------------------------------------------
 
@@ -1189,6 +1826,7 @@ def sdg_pipeline(
     statistical_metrics: Optional[list] = None,
     experiment_tag: Optional[str] = None,
     run_name: Optional[str] = None,
+    report: bool = True,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
@@ -1390,6 +2028,16 @@ def sdg_pipeline(
         force=force_generate,
     )
 
+    if report:
+        report_task(
+            stat_out=statistical_out,
+            priv_out=privacy_out,
+            det_out=detection_out,
+            halluc_out=halluc_out,
+            tstr_out=tstr_out,
+            base_name=base_name,
+        )
+
     return {
         "run_dir": output_dir,
         "fit_encoder": fit_out,
@@ -1500,6 +2148,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-dir", default=None, help="Shared population-encoder cache dir")
     parser.add_argument("--output-dir", default=None, help="Root output directory; every run nests under it as <run-name>/")
     parser.add_argument("--run-name", default=None, help="Run-directory name under --output-dir (default: <tag>_<dseed>_<library>_<model>_mseed<seed>, or the same without the <tag> segment when experiment.tag is unset)")
+    parser.add_argument("--no-report", action="store_true", default=False, help="Skip the end-of-run rich evaluation report + timing summary")
     return parser.parse_args()
 
 
@@ -1613,6 +2262,7 @@ if __name__ == "__main__":
         statistical_metrics=statistical_metrics,
         experiment_tag=experiment_tag,
         run_name=run_name,
+        report=not args.no_report,
         encoder_dir=encoder_dir,
         output_dir=output_dir,
     )

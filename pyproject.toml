@@ -67,6 +67,11 @@ dependencies = [
     # in the port).
     "syndat==0.13.6",
     "geomloss==0.2.6",
+    # Step 5 — report_task: the rich console panels ported from sdpype's
+    # flows/sdg_flow.py. rich is already pulled transitively (prefect/sdv) but
+    # resolves 14.3.4 here vs sdpype's 14.2.0 — pin it back for parity with
+    # the rest of the port.
+    "rich==14.2.0",
 ]
 
 [build-system]
