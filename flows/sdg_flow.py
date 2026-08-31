@@ -1117,14 +1117,16 @@ def sdg_pipeline(
 # ---------------------------------------------------------------------------
 #
 # Every setting can come from either a CLI flag or an optional --config YAML
-# file; a CLI flag always wins when both are given. This is a plain
-# yaml.safe_load — no OmegaConf, no interpolation/templating, no config-group
-# composition (that machinery is exactly what Step 1 dropped along with
-# Hydra). It exists because upcoming steps (recursive loop, evaluation
-# stages) need settings that are naturally nested dicts/lists — a 15-entry
-# statistical-metrics config, for instance — which don't have a sane CLI-flag
-# shape. Every flag below still works standalone with zero config file, as
-# already documented/verified in the README.
+# file; a CLI flag always wins when both are given. The config file mirrors
+# sdpype's params_step7_*.yaml nested layout (experiment / sdg / data /
+# encoding / generation / post_processing / evaluation) — see
+# configs/step7_pf_all.yaml. It is a plain yaml.safe_load: no OmegaConf, no
+# interpolation/templating, no config-group composition (that machinery is
+# what the scaffolding step dropped along with Hydra); the Hydra-only
+# experiment.name / tags templates are omitted. The evaluation block
+# (a 15-entry statistical-metrics list, per-metric parameters, ...) has no
+# sane CLI-flag shape, which is why the file exists — but every flag below
+# still works standalone with zero config file.
 
 VALID_MODEL_TYPES = {"arf", "ctgan", "ddpm", "rtvae", "nflow"}
 VALID_POST_PROCESS_METHODS = {"knn", "weighted", "random", "none"}
@@ -1154,11 +1156,29 @@ def _load_config(config_path: Optional[str]) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def _resolve(cli_value, config: dict, key: str, default=None):
-    """CLI value wins if given; else config[key] if present; else default."""
+_MISSING = object()
+
+
+def _cfg_get(config: dict, dotted: str, default=_MISSING):
+    """Walk a dotted path into a nested config dict (mirrors sdpype's
+    params.yaml layout, e.g. 'data.training_file', 'sdg.model_type',
+    'evaluation.hallucination.num_bins'). Returns default if any level is
+    absent; a key that is present but explicitly null returns None."""
+    node = config
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def _pick(cli_value, config: dict, dotted: str, default=None):
+    """CLI value wins if given; else the config's dotted-path value if the
+    path exists (even if null); else default."""
     if cli_value is not None:
         return cli_value
-    return config.get(key, default)
+    val = _cfg_get(config, dotted, _MISSING)
+    return default if val is _MISSING else val
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1193,49 +1213,55 @@ if __name__ == "__main__":
     args = _parse_args()
     config = _load_config(args.config)
 
-    training_file = _resolve(args.training_file, config, "training_file")
-    population_file = _resolve(args.population_file, config, "population_file")
-    metadata_file = _resolve(args.metadata_file, config, "metadata_file")
-    encoding_config_file = _resolve(args.encoding_config, config, "encoding_config")
-    model_type = _resolve(args.model_type, config, "model_type")
-    library = _resolve(args.library, config, "library", _DEFAULTS["library"])
-    seed = _resolve(args.seed, config, "seed", _DEFAULTS["seed"])
-    reference_file = _resolve(args.reference_file, config, "reference_file")
-    n_samples = _resolve(args.n_samples, config, "n_samples")
-    post_process_method = _resolve(args.post_process_method, config, "post_process_method", _DEFAULTS["post_process_method"])
-    knn_neighbors = _resolve(args.knn_neighbors, config, "knn_neighbors", _DEFAULTS["knn_neighbors"])
-    distance_metric = _resolve(args.distance_metric, config, "distance_metric", _DEFAULTS["distance_metric"])
-    fallback = _resolve(args.fallback, config, "fallback", _DEFAULTS["fallback"])
-    force_generate = _resolve(args.force_generate, config, "force_generate", _DEFAULTS["force_generate"])
-    encoder_dir = _resolve(args.encoder_dir, config, "encoder_dir", _DEFAULTS["encoder_dir"])
-    output_dir = _resolve(args.output_dir, config, "output_dir", _DEFAULTS["output_dir"])
+    # Nested config paths mirror sdpype's params_step7_*.yaml exactly; every
+    # CLI flag still overrides the matching key.
+    training_file = _pick(args.training_file, config, "data.training_file")
+    population_file = _pick(args.population_file, config, "data.population_file")
+    metadata_file = _pick(args.metadata_file, config, "data.metadata_file")
+    encoding_config_file = _pick(args.encoding_config, config, "encoding.config_file")
+    model_type = _pick(args.model_type, config, "sdg.model_type")
+    library = _pick(args.library, config, "sdg.library", _DEFAULTS["library"])
+    seed = _pick(args.seed, config, "experiment.seed", _DEFAULTS["seed"])
+    reference_file = _pick(args.reference_file, config, "data.reference_file")
+    n_samples = _pick(args.n_samples, config, "generation.n_samples")
 
-    # Evaluation-stage settings live under a nested "evaluation" block in
-    # --config (mirroring sdpype's params.yaml), so they need direct access
-    # rather than the flat _resolve() helper. A CLI flag still wins.
-    _eval_cfg = config.get("evaluation", {}) or {}
+    _pp = "post_processing.fix_invalid_categories."
+    post_process_method = _pick(args.post_process_method, config, _pp + "method", _DEFAULTS["post_process_method"])
+    # `enabled: false` in the config is shorthand for method "none" (only when
+    # --post-process-method wasn't given on the CLI).
+    if args.post_process_method is None and _cfg_get(config, _pp + "enabled", True) is False:
+        post_process_method = "none"
+    knn_neighbors = _pick(args.knn_neighbors, config, _pp + "knn_neighbors", _DEFAULTS["knn_neighbors"])
+    distance_metric = _pick(args.distance_metric, config, _pp + "distance_metric", _DEFAULTS["distance_metric"])
+    fallback = _pick(args.fallback, config, _pp + "fallback", _DEFAULTS["fallback"])
+
+    force_generate = _pick(args.force_generate, config, "force_generate", _DEFAULTS["force_generate"])
+    encoder_dir = _pick(args.encoder_dir, config, "encoder_dir", _DEFAULTS["encoder_dir"])
+    output_dir = _pick(args.output_dir, config, "output_dir", _DEFAULTS["output_dir"])
+
     if args.hallucination_num_bins is not None:
         hallucination_num_bins = args.hallucination_num_bins
     else:
-        hallucination_num_bins = (_eval_cfg.get("hallucination", {}) or {}).get(
-            "num_bins", _DEFAULTS["hallucination_num_bins"]
+        hallucination_num_bins = _cfg_get(
+            config, "evaluation.hallucination.num_bins", _DEFAULTS["hallucination_num_bins"]
         )
 
     if args.privacy_qi_columns is not None:
         privacy_qi_columns = [c.strip() for c in args.privacy_qi_columns.split(",") if c.strip()]
     else:
-        _priv_metrics = (_eval_cfg.get("privacy", {}) or {}).get("metrics", []) or []
+        _priv_metrics = _cfg_get(config, "evaluation.privacy.metrics", None) or []
         privacy_qi_columns = (
             (_priv_metrics[0].get("parameters", {}) or {}).get("qi_columns")
             if _priv_metrics else None
         )  # None -> sdg_pipeline() falls back to the pf_all QI set
 
-    # --params is a JSON string on the CLI, but config's "params" key is
+    # --params is a JSON string on the CLI; sdg.parameters in the config is
     # already a native mapping (YAML parses nested dicts directly).
     if args.params is not None:
         parameters = json.loads(args.params)
     else:
-        parameters = config.get("params", _DEFAULTS["params"])
+        _p = _cfg_get(config, "sdg.parameters", None)
+        parameters = _DEFAULTS["params"] if _p is None else _p
 
     missing = [
         name for name, value in [

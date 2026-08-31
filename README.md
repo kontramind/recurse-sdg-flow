@@ -99,11 +99,22 @@ versions (see `pyproject.toml`'s exact pins).
 
 ### SDG pipeline (`flows/sdg_flow.py`)
 
-Trains one of five synthcity-backed generators on a dseed's data and samples
-synthetic data from it. Runs the same three stages the original DVC/Hydra
-pipeline did — fit an encoder on the population data, encode the training
-data, train, generate — now driven entirely by CLI flags instead of a
-`params.yaml`.
+Trains one of five synthcity-backed generators on a dseed's data, samples
+synthetic data from it, and runs the evaluation stages — fit an encoder on
+the population data, encode the training data, train, generate, then
+encode-for-evaluation and compute hallucination / TSTR / privacy (k-anon)
+metrics. Same stages the original DVC/Hydra pipeline ran, now driven by a
+plain config file and/or CLI flags instead of Hydra.
+
+```bash
+uv run python3 flows/sdg_flow.py --config configs/step7_pf_all.yaml
+# or point at the pf_pilgram revision, and override any key on the CLI:
+uv run python3 flows/sdg_flow.py --config configs/step7_pf_pilgram.yaml --model-type ddpm --seed 28657
+```
+
+`configs/step7_pf_{all,pilgram}.yaml` are committed and mirror sdpype's
+`params_step7_pf_{all,pilgram}.yaml`. Everything can also be given purely as
+flags, no config file:
 
 ```bash
 uv run python3 flows/sdg_flow.py \
@@ -132,32 +143,31 @@ every experiment folder in the production data lake), so they're out of
 scope here. `--library` is kept as a real argument rather than hardcoded,
 so adding another backend later is a contained change, not a rewrite.
 
-Every setting above can also come from an optional `--config path/to/file.yaml`
-instead of (or alongside) CLI flags — a CLI flag always wins when both are
-given. This is a plain `yaml.safe_load`, not Hydra: no interpolation,
-templating, or config-group composition, just a flat mapping of the same
-option names (underscored: `training_file`, `model_type`, `post_process_method`,
-etc.), e.g.:
+The `--config` file mirrors sdpype's `params_step7_*.yaml` nested layout —
+`experiment` / `sdg` / `data` / `encoding` / `generation` /
+`post_processing` / `evaluation` — so it maps 1:1 onto the original
+experiment configs. It is a plain `yaml.safe_load`: no Hydra interpolation,
+`${...}` templating, or config-group composition (the Hydra-only
+`experiment.name` / `tags` templates are omitted — the port names runs
+`<model>_<training-stem>_<seed>`). A CLI flag always wins over the file.
+CLI-flag ↔ config-key mapping:
 
-```yaml
-training_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_training.csv
-population_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_population.csv
-metadata_file: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_metadata.json
-encoding_config: ../rd-lake/Step7/dseed1597_rev_pf_all/data_sample10000_dseed1597_rev_pf_all_encoding.yaml
-model_type: arf
-seed: 28657
-params: {}
-```
+| flag | config key |
+|---|---|
+| `--training-file` / `--population-file` / `--metadata-file` | `data.training_file` / `data.population_file` / `data.metadata_file` |
+| `--reference-file` | `data.reference_file` |
+| `--encoding-config` | `encoding.config_file` |
+| `--model-type` / `--library` / `--params` | `sdg.model_type` / `sdg.library` / `sdg.parameters` |
+| `--seed` | `experiment.seed` |
+| `--n-samples` | `generation.n_samples` |
+| `--post-process-method` / `--knn-neighbors` / `--distance-metric` / `--fallback` | `post_processing.fix_invalid_categories.{method,knn_neighbors,distance_metric,fallback}` (`enabled: false` → method `none`) |
+| `--hallucination-num-bins` | `evaluation.hallucination.num_bins` |
+| `--privacy-qi-columns` | `evaluation.privacy.metrics[0].parameters.qi_columns` |
 
-```bash
-uv run python3 flows/sdg_flow.py --config my_run.yaml
-uv run python3 flows/sdg_flow.py --config my_run.yaml --seed 111   # CLI --seed wins over the file's
-```
-
-This exists for settings that don't have a sane CLI-flag shape — the
-upcoming evaluation stages (statistical/privacy/detection metrics) have
-deeply nested per-metric configuration that only really works as a config
-file, not a wall of flags.
+The `evaluation.statistical_similarity` / `detection_evaluation` blocks
+(a 15-entry metrics list, per-metric `parameters`, ...) have no sane
+CLI-flag shape and are read straight from the config, with the Step7 values
+as built-in defaults.
 
 This writes, under `--output-dir`, in the same per-run tree layout the
 production data lake (`sd-lake/<run>/`) uses — so port output maps
