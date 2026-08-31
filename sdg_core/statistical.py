@@ -28,6 +28,9 @@ one metric at a time (the port is being built incrementally); each
     — see the module docstring)
   new_row_synthesis  -> NewRowSynthesisMetric  (sdmetrics.single_table.NewRowSynthesis
     compute_breakdown; synthetic_sample_size stays null — what made the ground truth)
+  wasserstein_distance -> WassersteinDistanceMetric  (custom CPU Sinkhorn OT via
+    geomloss.SamplesLoss on MinMax-scaled tensors — NOT synthcity's WassersteinDistance;
+    iterative, so match is close but not guaranteed bit-exact)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -59,8 +62,10 @@ from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
+import torch
 from sdv.metadata import SingleTableMetadata
 
+from geomloss import SamplesLoss
 from sdmetrics.single_column import (
     BoundaryAdherence,
     CategoryAdherence,
@@ -70,6 +75,7 @@ from sdmetrics.single_column import (
 from sdmetrics.single_table import TableStructure
 from sdmetrics.single_table.new_row_synthesis import NewRowSynthesis
 from sklearn.metrics.pairwise import euclidean_distances, rbf_kernel
+from sklearn.preprocessing import MinMaxScaler
 from syndat.metrics import jensen_shannon_distance as syndat_jsd
 from synthcity.metrics.eval_statistical import (
     AlphaPrecision,
@@ -1435,6 +1441,113 @@ class MaximumMeanDiscrepancyMetric:
             }
 
 
+# --- SIMPLIFIED CPU WASSERSTEIN IMPLEMENTATION ---
+def evaluate_wasserstein(
+    original_encoded_df: pd.DataFrame,
+    synthetic_encoded_df: pd.DataFrame,
+) -> float:
+    """
+    Compute Wasserstein distance using a CPU-only, tensorized Sinkhorn OT backend.
+
+    Assumes input DataFrames are already encoded (all numeric).
+    """
+    X = original_encoded_df.to_numpy(dtype=np.float32)
+    X_syn = synthetic_encoded_df.to_numpy(dtype=np.float32)
+
+    # 1) If synthetic has fewer rows, pad it with zeros
+    if X.shape[0] > X_syn.shape[0]:
+        pad_rows = X.shape[0] - X_syn.shape[0]
+        X_syn = np.concatenate(
+            [X_syn, np.zeros((pad_rows, X.shape[1]), dtype=X_syn.dtype)],
+            axis=0,
+        )
+    # If original has fewer rows, pad it with zeros (unlikely but safe)
+    elif X_syn.shape[0] > X.shape[0]:
+        pad_rows = X_syn.shape[0] - X.shape[0]
+        X = np.concatenate(
+            [X, np.zeros((pad_rows, X.shape[1]), dtype=X.dtype)],
+            axis=0,
+        )
+
+    # 2) MinMax-scale features using real data statistics
+    scaler = MinMaxScaler().fit(X)
+    X_scaled = scaler.transform(X)
+    X_syn_scaled = scaler.transform(X_syn)
+
+    # 3) Convert to CPU tensors
+    X_ten = torch.from_numpy(X_scaled)
+    X_syn_ten = torch.from_numpy(X_syn_scaled)
+
+    # 4) Sinkhorn OT distance, tensorized backend (CPU)
+    OT_solver = SamplesLoss(
+        loss="sinkhorn",
+        backend="tensorized",
+    )
+
+    with torch.no_grad():
+        dist = OT_solver(X_ten, X_syn_ten).cpu().numpy().item()
+
+    return float(dist)
+# --- END SIMPLIFIED CPU WASSERSTEIN IMPLEMENTATION ---
+
+
+class WassersteinDistanceMetric:
+    """Wasserstein Distance metric implementation (now CPU-based)"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        # Removed: self.evaluator = WassersteinDistance()
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate Wasserstein Distance metric"""
+        start_time = time.time()
+
+        try:
+            # 1. Use encoding config to identify the correct subset of columns
+            if encoding_config:
+                usable_cols = get_encoded_numeric_columns(encoding_config, original, metadata)
+                log_column_selection("Wasserstein Distance", encoding_config, original, metadata, usable_cols)
+            else:
+                # Fallback logic (unchanged)
+                numeric_cols = get_columns_by_sdtype(metadata, ['numerical'])
+                datetime_cols = get_columns_by_sdtype(metadata, ['datetime'])
+                categorical_cols = get_columns_by_sdtype(metadata, ['categorical'])
+                numeric_categorical_cols = [
+                    col for col in categorical_cols
+                    if pd.api.types.is_numeric_dtype(original[col])
+                ]
+                usable_cols = numeric_cols + datetime_cols + numeric_categorical_cols
+                print(f"  Wasserstein Distance using {len(usable_cols)} columns (fallback mode)")
+
+            if not usable_cols:
+                raise ValueError("No numeric columns found for Wasserstein Distance metric")
+
+            # 2. Select only usable columns (which are already encoded/numeric)
+            original_numeric = original[usable_cols].copy()
+            synthetic_numeric = synthetic[usable_cols].copy()
+
+            # 3. Run evaluation using the CPU function
+            # NOTE: We pass the two pre-processed DataFrames directly
+            joint_distance = evaluate_wasserstein(original_numeric, synthetic_numeric)
+
+            # ... (rest of the return dict is unchanged) ...
+            return {
+                "joint_distance": float(joint_distance),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            # ... (error handling is unchanged) ...
+            return {
+                "joint_distance": 0.0,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
 class NewRowSynthesisMetric:
     """NewRowSynthesis metric implementation"""
 
@@ -1634,6 +1747,8 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return MaximumMeanDiscrepancyMetric(**parameters)
         case "new_row_synthesis":
             return NewRowSynthesisMetric(**parameters)
+        case "wasserstein_distance":
+            return WassersteinDistanceMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 

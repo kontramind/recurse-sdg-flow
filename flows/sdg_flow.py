@@ -20,8 +20,8 @@ privacy_evaluation, detection_evaluation, statistical_similarity
 (table_structure, semantic_structure, boundary_adherence,
 category_adherence, alpha_precision, prdc_score, the three
 jensenshannon_* variants, maximum_mean_discrepancy (corrected),
-new_row_synthesis, ks_complement, tv_complement so far; the remaining
-statistical sub-metrics are added one per commit).
+new_row_synthesis, wasserstein_distance, ks_complement, tv_complement so
+far; the remaining statistical sub-metrics are added one per commit).
 
 Usage:
     python flows/sdg_flow.py \\
@@ -1224,6 +1224,8 @@ def sdg_pipeline(
             {"name": "jensenshannon_synthcity", "parameters": {"normalize": True, "n_histogram_bins": 10}},
             {"name": "jensenshannon_syndat", "parameters": {"n_unique_threshold": 10}},
             {"name": "jensenshannon_nannyml", "parameters": {}},
+            # Custom CPU Sinkhorn OT (geomloss), NOT synthcity's WassersteinDistance.
+            {"name": "wasserstein_distance", "parameters": {}},
             # Corrected MMD (not synthcity's degenerate one). gamma=None here ->
             # the metric falls back to a per-run median-heuristic gamma; a
             # --config run passes the frozen per-variant value.
