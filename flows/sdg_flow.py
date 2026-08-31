@@ -15,7 +15,8 @@ The evaluation stages from sdpype's own "# Evaluation tasks" marker onward
 (encode_evaluation, then statistical / privacy / detection / hallucination /
 TSTR + report) are being ported incrementally, one stage per commit, each
 verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
-encode_evaluation, hallucination_evaluation, tstr_evaluation.
+encode_evaluation, hallucination_evaluation, tstr_evaluation,
+privacy_evaluation.
 
 Usage:
     python flows/sdg_flow.py \\
@@ -40,6 +41,7 @@ import pandas as pd
 import torch
 import yaml
 from prefect import flow, task
+from sdv.metadata import SingleTableMetadata
 
 from flows.lgbm_cv_flow import encode_features, evaluate_on_test, train_final_model
 from sdg_core.downstream import LGBMBayesianTuner
@@ -55,6 +57,7 @@ from sdg_core.hallucination import (
 )
 from sdg_core.hashing import calculate_file_hash
 from sdg_core.metadata import load_csv_with_metadata
+from sdg_core.privacy import evaluate_privacy_metrics, generate_privacy_report
 from sdg_core.serialization import create_model_metadata, load_model, save_model
 from sdg_core.training import create_experiment_hash, create_synthcity_model
 
@@ -878,8 +881,81 @@ def tstr_evaluation(
     return {**payload, "metrics_path": str(metrics_path)}
 
 
+@task(name="privacy-evaluation", log_prints=True)
+def privacy_evaluation(
+    metadata_file: str,
+    population_file: str,
+    training_file: str,
+    reference_decoded_path: str,
+    synthetic_decoded_path: str,
+    base_name: str,
+    output_dir: str,
+    qi_columns: list,
+    force: bool = False,
+) -> dict:
+    """
+    Privacy metrics — k-anonymisation of the quasi-identifier columns, computed
+    on the decoded reference / synthetic / population / training data via
+    synthcity's kAnonymization, plus k-ratios between them.
+
+    Ported from sdpype flows/sdg_flow.py::privacy_evaluation — flat args instead
+    of a cfg dict, base_name in place of experiment_name/seed, sd-lake metrics/
+    layout. Only k_anonymization is wired (the sole metric in the Step7 privacy
+    config); dcr_baseline_protection isn't ported (see sdg_core/privacy.py).
+    Consumes encode_evaluation's decoded reference + synthetic.
+    """
+    metadata_file = Path(metadata_file)
+    population_file = Path(population_file)
+    training_file = Path(training_file)
+    reference_decoded_path = Path(reference_decoded_path)
+    synthetic_decoded_path = Path(synthetic_decoded_path)
+
+    for p in (metadata_file, population_file, training_file, reference_decoded_path, synthetic_decoded_path):
+        if not p.exists():
+            raise FileNotFoundError(f"Required file not found: {p}")
+
+    metrics_dir = Path(output_dir) / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = metrics_dir / f"privacy_{base_name}.json"
+    report_path = metrics_dir / f"privacy_report_{base_name}.txt"
+
+    result = {"metrics_path": str(metrics_path), "report_path": str(report_path)}
+    if not force and metrics_path.exists():
+        print(f"Reusing existing privacy metrics: {metrics_path}")
+        return result
+
+    metrics_config = [{"name": "k_anonymization", "parameters": {"qi_columns": list(qi_columns)}}]
+
+    metadata = SingleTableMetadata.load_from_json(str(metadata_file))
+    reference_decoded = load_csv_with_metadata(reference_decoded_path, metadata_file)
+    synthetic_decoded = load_csv_with_metadata(synthetic_decoded_path, metadata_file)
+    population_data = load_csv_with_metadata(population_file, metadata_file)
+    training_data = load_csv_with_metadata(training_file, metadata_file)
+
+    print(f"Running {len(metrics_config)} privacy metric(s) ...  QI: {list(qi_columns)}")
+    results = evaluate_privacy_metrics(
+        reference_decoded,
+        synthetic_decoded,
+        metrics_config,
+        experiment_name=base_name,
+        metadata=metadata,
+        reference_data_decoded=reference_decoded,
+        synthetic_data_decoded=synthetic_decoded,
+        population_data=population_data,
+        training_data=training_data,
+    )
+
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    report_path.write_text(generate_privacy_report(results), encoding="utf-8")
+
+    print(f"Saved privacy metrics → {metrics_path}")
+    print(f"Saved privacy report  → {report_path}")
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Flow — encode → train → generate → evaluation-encode → hallucination → TSTR
+# Flow — encode → train → generate → evaluation-encode → hallucination → TSTR → privacy
 # ---------------------------------------------------------------------------
 
 @flow(name="sdg-pipeline")
@@ -900,6 +976,7 @@ def sdg_pipeline(
     fallback: str = "weighted",
     force_generate: bool = False,
     hallucination_num_bins: int = 20,
+    privacy_qi_columns: Optional[list] = None,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
@@ -908,6 +985,10 @@ def sdg_pipeline(
     # not a shortcut.
     if reference_file is None:
         reference_file = training_file
+    # Step7 pf_all quasi-identifier set (pf_pilgram drops "gender"); override
+    # via --privacy-qi-columns or evaluation.privacy.metrics[0].parameters.
+    if privacy_qi_columns is None:
+        privacy_qi_columns = ["age", "gender", "ethnicity", "admission_type"]
 
     run_params = {
         "training_file": training_file,
@@ -1007,6 +1088,18 @@ def sdg_pipeline(
         force=force_generate,
     )
 
+    privacy_out = privacy_evaluation(
+        metadata_file=metadata_file,
+        population_file=population_file,
+        training_file=training_file,
+        reference_decoded_path=eval_encode_out["decoded_reference"],
+        synthetic_decoded_path=eval_encode_out["decoded_synthetic"],
+        base_name=base_name,
+        output_dir=output_dir,
+        qi_columns=privacy_qi_columns,
+        force=force_generate,
+    )
+
     return {
         "fit_encoder": fit_out,
         "encode_data": encode_out,
@@ -1015,6 +1108,7 @@ def sdg_pipeline(
         "encode_evaluation": eval_encode_out,
         "hallucination": halluc_out,
         "tstr": tstr_out,
+        "privacy": privacy_out,
     }
 
 
@@ -1069,7 +1163,7 @@ def _resolve(cli_value, config: dict, key: str, default=None):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the SDG pipeline (encode -> train -> generate -> encode_evaluation -> hallucination -> tstr)",
+        description="Run the SDG pipeline (encode -> train -> generate -> encode_evaluation -> hallucination -> tstr -> privacy)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="Optional path to a plain YAML config file; CLI flags below override it")
@@ -1089,6 +1183,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fallback", default=None, choices=sorted(VALID_FALLBACKS), help="Fallback method when a column is 100%% invalid")
     parser.add_argument("--force-generate", action="store_true", default=None, help="Regenerate synthetic data even if cached output exists")
     parser.add_argument("--hallucination-num-bins", type=int, default=None, help="Bins for the hallucination metric's numerical quantisation (or evaluation.hallucination.num_bins in --config)")
+    parser.add_argument("--privacy-qi-columns", default=None, help="Comma-separated quasi-identifier columns for k-anonymity (or evaluation.privacy.metrics[0].parameters.qi_columns in --config; default: pf_all set)")
     parser.add_argument("--encoder-dir", default=None, help="Shared population-encoder cache dir")
     parser.add_argument("--output-dir", default=None, help="Per-run output directory")
     return parser.parse_args()
@@ -1125,6 +1220,15 @@ if __name__ == "__main__":
         hallucination_num_bins = (_eval_cfg.get("hallucination", {}) or {}).get(
             "num_bins", _DEFAULTS["hallucination_num_bins"]
         )
+
+    if args.privacy_qi_columns is not None:
+        privacy_qi_columns = [c.strip() for c in args.privacy_qi_columns.split(",") if c.strip()]
+    else:
+        _priv_metrics = (_eval_cfg.get("privacy", {}) or {}).get("metrics", []) or []
+        privacy_qi_columns = (
+            (_priv_metrics[0].get("parameters", {}) or {}).get("qi_columns")
+            if _priv_metrics else None
+        )  # None -> sdg_pipeline() falls back to the pf_all QI set
 
     # --params is a JSON string on the CLI, but config's "params" key is
     # already a native mapping (YAML parses nested dicts directly).
@@ -1170,6 +1274,7 @@ if __name__ == "__main__":
         fallback=fallback,
         force_generate=bool(force_generate),
         hallucination_num_bins=hallucination_num_bins,
+        privacy_qi_columns=privacy_qi_columns,
         encoder_dir=encoder_dir,
         output_dir=output_dir,
     )
