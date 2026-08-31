@@ -17,6 +17,8 @@ one metric at a time (the port is being built incrementally); each
   category_adherence -> CategoryAdherenceMetric  (sdmetrics.single_column.CategoryAdherence)
   table_structure    -> TableStructureMetric     (sdmetrics.single_table.TableStructure + pandas-dtype table)
   semantic_structure -> SemanticStructureMetric  (pure-python metadata sdtype compare)
+  alpha_precision    -> AlphaPrecisionMetric     (synthcity.metrics.eval_statistical.AlphaPrecision)
+  prdc_score         -> PRDCScoreMetric          (synthcity.metrics.eval_statistical.PRDCScore)
 `evaluate_statistical_metrics` (generic router) and
 `generate_statistical_report` (per-metric guarded) are ported whole and
 already handle every metric name; only the factory grows per commit.
@@ -44,6 +46,8 @@ from sdmetrics.single_column import (
     TVComplement,
 )
 from sdmetrics.single_table import TableStructure
+from synthcity.metrics.eval_statistical import AlphaPrecision, PRDCScore
+from synthcity.plugins.core.dataloader import GenericDataLoader
 
 
 def ensure_json_serializable(obj: Any) -> Any:
@@ -908,6 +912,156 @@ class SemanticStructureMetric:
             }
 
 
+class AlphaPrecisionMetric:
+    """Alpha Precision metric implementation.
+
+    NOTE on reproducibility: the ``*_naive`` scores are deterministic
+    (MinMaxScaler + kNN) and reproduce sd-lake exactly. The ``*_OC``
+    (optimally-corrected) scores go through synthcity's OneClassLayer NN
+    embedding, whose ``fit()`` (synthcity 0.2.12) is unseeded — so the OC
+    scores vary run to run (synthcity disk-caches the trained model per
+    real-data hash under ``./workspace/``, making them stable *within* an
+    environment after the first call, but not equal to sd-lake's stored
+    values). Same class of upstream non-determinism as MMD; the port runs
+    the identical synthcity code.
+    """
+
+    def __init__(self, **parameters):
+        self.evaluator = AlphaPrecision()
+        self.parameters = parameters  # Store for reporting
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate Alpha Precision metric"""
+
+        start_time = time.time()
+
+        try:
+            # Use encoding config as source of truth for which columns are numeric
+            if encoding_config:
+                usable_cols = get_encoded_numeric_columns(encoding_config, original, metadata)
+                log_column_selection("Alpha Precision", encoding_config, original, metadata, usable_cols)
+            else:
+                # Fallback to old logic if no encoding config provided
+                numeric_cols = get_columns_by_sdtype(metadata, ['numerical'])
+                datetime_cols = get_columns_by_sdtype(metadata, ['datetime'])
+                categorical_cols = get_columns_by_sdtype(metadata, ['categorical'])
+                numeric_categorical_cols = [
+                    col for col in categorical_cols
+                    if pd.api.types.is_numeric_dtype(original[col])
+                ]
+                usable_cols = numeric_cols + datetime_cols + numeric_categorical_cols
+                print(f"  Alpha Precision using {len(usable_cols)} columns (fallback mode)")
+
+            if not usable_cols:
+                raise ValueError("No numeric columns found for Alpha Precision metric")
+
+            # Select only usable columns
+            original_numeric = original[usable_cols].copy()
+            synthetic_numeric = synthetic[usable_cols].copy()
+
+            # Create data loaders
+            real_loader = GenericDataLoader(original_numeric)
+            synth_loader = GenericDataLoader(synthetic_numeric)
+
+            # Run evaluation
+            result = self.evaluator.evaluate(real_loader, synth_loader)
+            scores = {
+                "delta_precision_alpha_OC": float(result.get("delta_precision_alpha_OC", 0.0)),
+                "delta_coverage_beta_OC": float(result.get("delta_coverage_beta_OC", 0.0)),
+                "authenticity_OC": float(result.get("authenticity_OC", 0.0)),
+                "delta_precision_alpha_naive": float(result.get("delta_precision_alpha_naive", 0.0)),
+                "delta_coverage_beta_naive": float(result.get("delta_coverage_beta_naive", 0.0)),
+                "authenticity_naive": float(result.get("authenticity_naive", 0.0))
+            }
+
+            return {
+                "scores": scores,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "scores": {
+                    "delta_precision_alpha_OC": 0.0,
+                    "delta_coverage_beta_OC": 0.0,
+                    "authenticity_OC": 0.0,
+                    "delta_precision_alpha_naive": 0.0,
+                    "delta_coverage_beta_naive": 0.0,
+                    "authenticity_naive": 0.0
+                },
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
+class PRDCScoreMetric:
+    """PRDC Score metric implementation"""
+
+    def __init__(self, **parameters):
+        self.parameters = parameters
+        self.evaluator = PRDCScore(nearest_k=parameters.get("nearest_k", 5))
+
+    def evaluate(self, original: pd.DataFrame, synthetic: pd.DataFrame, metadata: SingleTableMetadata, encoding_config: dict = None) -> Dict[str, Any]:
+        """Evaluate PRDC Score metric"""
+        start_time = time.time()
+
+        try:
+            # Use encoding config as source of truth for which columns are numeric
+            if encoding_config:
+                usable_cols = get_encoded_numeric_columns(encoding_config, original, metadata)
+                log_column_selection("PRDC Score", encoding_config, original, metadata, usable_cols)
+            else:
+                # Fallback to old logic if no encoding config provided
+                numeric_cols = get_columns_by_sdtype(metadata, ['numerical'])
+                datetime_cols = get_columns_by_sdtype(metadata, ['datetime'])
+                categorical_cols = get_columns_by_sdtype(metadata, ['categorical'])
+                numeric_categorical_cols = [
+                    col for col in categorical_cols
+                    if pd.api.types.is_numeric_dtype(original[col])
+                ]
+                usable_cols = numeric_cols + datetime_cols + numeric_categorical_cols
+                print(f"  PRDC Score using {len(usable_cols)} columns (fallback mode)")
+
+            if not usable_cols:
+                raise ValueError("No numeric columns found for PRDC Score metric")
+
+            # Select only usable columns
+            original_numeric = original[usable_cols].copy()
+            synthetic_numeric = synthetic[usable_cols].copy()
+
+            # Create data loaders
+            real_loader = GenericDataLoader(original_numeric)
+            synth_loader = GenericDataLoader(synthetic_numeric)
+
+            # Run evaluation
+            result = self.evaluator.evaluate(real_loader, synth_loader)
+
+            # PRDC returns a dict with precision, recall, density, coverage
+            return {
+                "precision": float(result.get("precision", 0.0)),
+                "recall": float(result.get("recall", 0.0)),
+                "density": float(result.get("density", 0.0)),
+                "coverage": float(result.get("coverage", 0.0)),
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "success"
+            }
+        except Exception as e:
+            return {
+                "precision": 0.0,
+                "recall": 0.0,
+                "density": 0.0,
+                "coverage": 0.0,
+                "parameters": self.parameters,
+                "execution_time": time.time() - start_time,
+                "status": "error",
+                "error_message": str(e)
+            }
+
+
 # ===========================================================================
 # Dispatch
 # ===========================================================================
@@ -1048,6 +1202,10 @@ def get_metric_evaluator(metric_name: str, parameters: Dict[str, Any]):
             return TableStructureMetric(**parameters)
         case "semantic_structure":
             return SemanticStructureMetric(**parameters)
+        case "alpha_precision":
+            return AlphaPrecisionMetric(**parameters)
+        case "prdc_score":
+            return PRDCScoreMetric(**parameters)
         case _:
             raise ValueError(f"Unknown metric: {metric_name}")
 

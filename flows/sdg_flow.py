@@ -17,9 +17,10 @@ TSTR + report) are being ported incrementally, one stage per commit, each
 verified against real gen-0 artifacts in ../sd-lake/. Currently wired:
 encode_evaluation, hallucination_evaluation, tstr_evaluation,
 privacy_evaluation, detection_evaluation, statistical_similarity
-(table_structure, semantic_structure, ks_complement, tv_complement,
-boundary_adherence, category_adherence so far; the remaining statistical
-sub-metrics are added one per commit).
+(table_structure, semantic_structure, boundary_adherence,
+category_adherence, alpha_precision, prdc_score, ks_complement,
+tv_complement so far; the remaining statistical sub-metrics are added one
+per commit).
 
 Usage:
     python flows/sdg_flow.py \\
@@ -1215,10 +1216,12 @@ def sdg_pipeline(
         statistical_metrics = [
             {"name": "table_structure", "parameters": {}},
             {"name": "semantic_structure", "parameters": {}},
-            {"name": "ks_complement", "parameters": {"target_columns": None}},
-            {"name": "tv_complement", "parameters": {"target_columns": None}},
             {"name": "boundary_adherence", "parameters": {"target_columns": None}},
             {"name": "category_adherence", "parameters": {"target_columns": None}},
+            {"name": "alpha_precision", "parameters": {}},
+            {"name": "prdc_score", "parameters": {"nearest_k": 5}},
+            {"name": "ks_complement", "parameters": {"target_columns": None}},
+            {"name": "tv_complement", "parameters": {"target_columns": None}},
         ]
 
     # Run-directory wrapper: every run nests under output_dir/<run_name>/ so
