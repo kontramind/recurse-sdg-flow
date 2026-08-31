@@ -11,8 +11,12 @@ TBD]. It is being assembled incrementally:
 3. ✅ TRTR baseline (`flows/lgbm_cv_flow.py`) — LightGBM + Optuna HPO on real
    data, the reference point TSTR is later measured against
 4. ✅ Minimal Prefect pipeline (`flows/sdg_flow.py`): encode → train → generate
-5. ⏳ Recursive multi-generation loop
-6. ⏳ Evaluation stages (statistical, privacy, detection, hallucination, TSTR)
+5. ✅ Evaluation stages (`flows/sdg_flow.py`): encode-for-eval, statistical
+   similarity (15 sub-metrics), privacy (k-anonymity), detection (C2ST),
+   hallucination, TSTR — plus an end-of-run rich console report + timing
+   summary. Every metric verified against the production data lake's gen-0
+   artifacts (see *Reproducibility* below).
+6. ⏳ Recursive multi-generation loop
 
 ## Setup
 
@@ -80,8 +84,8 @@ uv run python3 flows/lgbm_cv_flow.py \
 This writes `lgbm_cv_<timestamp>.{json,md,pkl}` plus
 `shap_importance_<timestamp>.{csv,png}` into `--output-dir`, and — since
 `--test-dataset` was given — also copies the metrics JSON next to the test
-CSV in the dseed folder (matching the layout a later TSTR stage will expect
-to auto-discover it from). The JSON's `best_params` and decision `threshold`
+CSV in the dseed folder, where the SDG pipeline's TSTR stage auto-discovers
+it. The JSON's `best_params` and decision `threshold`
 are meant to be **frozen and reused** for every TSTR run on that dseed —
 don't re-tune per generation, or you'd conflate synthetic-data quality
 decline with the optimizer landing on different hyperparameters.
@@ -100,11 +104,27 @@ versions (see `pyproject.toml`'s exact pins).
 ### SDG pipeline (`flows/sdg_flow.py`)
 
 Trains one of five synthcity-backed generators on a dseed's data, samples
-synthetic data from it, and runs the evaluation stages — fit an encoder on
-the population data, encode the training data, train, generate, then
-encode-for-evaluation and compute hallucination / TSTR / privacy (k-anon)
-metrics. Same stages the original DVC/Hydra pipeline ran, now driven by a
-plain config file and/or CLI flags instead of Hydra.
+synthetic data from it, and runs the full evaluation suite: fit an encoder
+on the population data, encode the training data, train, generate, then
+encode-for-evaluation and compute
+
+- **statistical similarity** — all 15 sub-metrics (`table_structure`,
+  `semantic_structure`, `boundary_adherence`, `category_adherence`,
+  `alpha_precision`, `prdc_score`, `wasserstein_distance`,
+  `maximum_mean_discrepancy`, `new_row_synthesis`, `jensenshannon_synthcity`
+  / `_syndat` / `_nannyml`, `ks_complement`, `tv_complement`,
+  `sdmetrics_quality`)
+- **privacy** — k-anonymity over a quasi-identifier set
+- **detection** — synthcity real-vs-synthetic classifier two-sample test
+- **hallucination** — TotalFR / NovelFR / MemorizedFR / HR against the
+  population
+- **TSTR** — train LightGBM on synthetic, test on the real held-out set,
+  with the frozen TRTR params from step 3
+
+Each stage writes a `metrics/<stage>_<base_name>.json` (+ a `*_report.txt`),
+then a rich console report prints every stage as a table plus a per-stage
+timing summary (`--no-report` skips it). Same stages the original DVC/Hydra
+pipeline ran, now driven by a plain config file and/or CLI flags.
 
 ```bash
 uv run python3 flows/sdg_flow.py --config configs/step7_pf_all.yaml
@@ -186,7 +206,10 @@ convention; `<dseed>` is the `dseedNNN` token from the training-file path,
   data/synthetic/synthetic_data_<base_name>_decoded.csv
   models/training_encoder_<base_name>.pkl      # per-run copy of the population encoder
   models/sdg_model_<base_name>.pkl             # trained generator
-  metrics/{encoding,training,generation}_<base_name>.json
+  models/evaluation_encoder_<base_name>.pkl    # encoder refit on the reference data
+  metrics/{encoding,training,generation,encoding_evaluation}_<base_name>.json
+  metrics/{statistical_similarity,privacy,detection_evaluation,hallucination,tstr}_<base_name>.json
+  metrics/{statistical,privacy,detection,hallucination}_report_<base_name>.txt
 ```
 
 The remaining structural departure from `sd-lake` is `<base_name>` itself —
@@ -219,3 +242,18 @@ neural-net training in general (same shapes/columns/dtypes, distributions
 in the same range, but not identical values). `nflow` has no production
 run anywhere to compare against — it's smoke-tested only (runs cleanly,
 correct output shape).
+
+The **evaluation stages** were verified the same way: fed each of the four
+production models' real gen-0 encoded/decoded data, every metric block
+reproduces the production data lake's stored JSON bit-for-bit (modulo
+wall-clock timing fields). Two deliberate exceptions:
+
+- `maximum_mean_discrepancy` — the in-pipeline synthcity metric hardcodes
+  `gamma = 1.0` on unit-scaled data and collapses to a `2/n` floor
+  (`≈ 0.0002` for every generator). This port computes the **corrected**
+  MMD instead (z-score on the real reference, a frozen per-variant RBF
+  gamma, unbiased estimator), matching the paper's post-hoc recomputation
+  rather than the degenerate stored value.
+- `alpha_precision`'s `*_OC` fields depend on an unseeded one-class network
+  fit in synthcity 0.2.12, so they are not bit-reproducible across
+  processes; the `*_naive` variant and `prdc_score` are exact.
