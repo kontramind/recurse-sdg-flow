@@ -31,6 +31,15 @@ dependencies = [
     # scipy.stats internally, directly in the byte-exact-verified encode path
     "scipy==1.13.1",
     "Faker==38.2.0",
+    # Step 4 — train/generate stages (synthcity-backed generators: arf,
+    # ctgan, ddpm, rtvae, nflow). Pinned exact to sdpype's installed
+    # versions — this GPU/torch stack took real effort to get working
+    # together on this machine's CUDA 12.8 Blackwell GPU, must not drift.
+    "synthcity==0.2.12",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "torchaudio==2.9.1",
+    "opacus==1.4.1",
 ]
 
 [build-system]
@@ -39,3 +48,31 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sdg_core"]
+
+# UV TOOL CONFIGURATION for CUDA 12.8 support, copied from sdpype/pyproject.toml.
+[tool.uv]
+# Force this exact PyTorch build despite synthcity (or other dependencies)
+# potentially requiring torch<2.3. Tightened to exact versions here (sdpype's
+# own block uses loose >= bounds) to match this project's exact-pin
+# philosophy and stop a future `uv lock --upgrade` from silently drifting.
+override-dependencies = [
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "torchaudio==2.9.1",
+]
+constraint-dependencies = [
+    "numpy<2.0",
+    "scipy<1.14",
+    "opacus<1.5.0",
+]
+
+# Kept for parity with sdpype's pyproject.toml, but verified inert: sdpype's
+# own uv.lock resolves torch/torchvision/torchaudio from plain PyPI
+# (source = "https://pypi.org/simple"), not this index — no [tool.uv.sources]
+# entry routes to it. Today's PyPI wheel for torch==2.9.1 on Linux/x86_64
+# happens to be the cu128 build already. Don't rely on this block for CUDA
+# support — verify with `torch.cuda.is_available()` after `uv sync` instead.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
