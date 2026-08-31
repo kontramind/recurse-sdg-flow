@@ -40,6 +40,20 @@ dependencies = [
     "torchvision==0.24.1",
     "torchaudio==2.9.1",
     "opacus==1.4.1",
+    # Step 5 — evaluation stages. sdpype's eval code uses the real
+    # sdv.metadata.SingleTableMetadata (load_from_json / .columns / .to_dict);
+    # adding the real package rather than a shim keeps the metadata bytes fed
+    # to sdmetrics/synthcity/k-anon identical to production, and leaves the
+    # door open to SDV-backed generators/metrics later. sdv also pulls
+    # sdmetrics (needed for the statistical stage) + copulas/ctgan/graphviz/
+    # boto3 — transitive drift on the numerically-sensitive set is pinned via
+    # constraint-dependencies below (same lock-diff procedure as Steps 3-4).
+    "sdv==1.30.0",
+    # sdv's loose bounds resolve sdmetrics 0.30.0; sdpype has 0.28.0 and the
+    # statistical stage reaches into sdmetrics' private
+    # reports.single_table._properties API (SpearmanColumnPairTrends), so pin
+    # it directly to sdpype's version.
+    "sdmetrics==0.28.0",
 ]
 
 [build-system]
@@ -64,6 +78,15 @@ constraint-dependencies = [
     "numpy<2.0",
     "scipy<1.14",
     "opacus<1.5.0",
+    # sdv's transitive deps drift newer than sdpype's installed versions.
+    # copulas is numerically load-bearing (sdmetrics' correlation / quality
+    # computations); ctgan/deepecho are unused SDV synthesizers but hard sdv
+    # deps — pinned to sdpype's versions for parity. Infra churn
+    # (boto3/botocore/platformdirs/s3transfer/jmespath) left as-is: not on any
+    # computation path.
+    "copulas==0.12.3",
+    "ctgan==0.11.1",
+    "deepecho==0.7.0",
 ]
 
 # Kept for parity with sdpype's pyproject.toml, but verified inert: sdpype's
