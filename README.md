@@ -9,11 +9,11 @@ evaluation suite, then feeds the synthetic data back in as training input
 and repeats — for *N* generations — to study how synthetic data degrades
 under recursive training.
 
-Ported from a large research monorepo (`sdpype`): Hydra and DVC are dropped,
-the ~90 one-off analysis scripts are not carried, and the two parallel
-DVC/Prefect pipelines collapse to one. Every stage is verified to reproduce
-the original's stored production results — see **Reproducibility** at the
-end.
+Extracted from a large research monorepo (`sdpype`): the config-framework
+and build-orchestration layers are dropped, the ~90 one-off analysis
+scripts are not carried, and two parallel pipeline implementations collapse
+to one. Every stage is verified to reproduce the original's stored
+production results — see **Reproducibility** at the end.
 
 ## Pipeline
 
@@ -208,10 +208,11 @@ the training data's real categories (default `knn`; `none` disables the step).
 `--config` mirrors `sdpype`'s `params_step7_*.yaml` nested layout —
 `experiment` / `sdg` / `data` / `encoding` / `generation` /
 `post_processing` / `evaluation` — so it maps 1:1 onto the original configs.
-It is a plain `yaml.safe_load`: no Hydra interpolation, `${...}` templating,
-or config-group composition (the Hydra-only `experiment.name` / `tags`
-templates are omitted; `experiment.tag` is kept — it names the run
-directory). A CLI flag always wins over the file.
+It is read with a plain `yaml.safe_load`: literal values only, no
+interpolation, `${...}` templating, or config-group composition. The
+original's computed `experiment.name` / `tags` fields are omitted;
+`experiment.tag` is kept — it names the run directory. A CLI flag always
+wins over the file.
 
 | flag | config key |
 |---|---|
@@ -259,11 +260,10 @@ population encoder is cached separately under `--encoder-dir` (default
 file — fit once and reused across every run that shares it.
 
 The one structural departure from `sd-lake` is `<base_name>` itself:
-`<model-type>_<training-file-stem>_<seed>` here, versus the Hydra
-`experiment_name` template
-(`synthcity_<model>_<3 data hashes>_gen_<N>_<tag>_<config hash>_<mseed>`) in
-production, dropped along with Hydra. File *contents* still match
-byte-for-byte (see **Reproducibility**).
+`<model-type>_<training-file-stem>_<seed>` here, versus the original's
+computed `experiment_name`
+(`synthcity_<model>_<3 data hashes>_gen_<N>_<tag>_<config hash>_<mseed>`).
+File *contents* still match byte-for-byte (see **Reproducibility**).
 
 ### Recursive loop (`flows/recursive_sdg_flow.py`)
 
