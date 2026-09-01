@@ -12,8 +12,8 @@ under recursive training.
 Ported from a large research monorepo (`sdpype`): Hydra and DVC are dropped,
 the ~90 one-off analysis scripts are not carried, and the two parallel
 DVC/Prefect pipelines collapse to one. Every stage is verified to reproduce
-the original's stored production results — see the **Reproducibility** note
-in each section.
+the original's stored production results — see **Reproducibility** at the
+end.
 
 ## Pipeline
 
@@ -24,9 +24,8 @@ in each section.
 | SDG pipeline | `flows/sdg_flow.py` | one generation: encode → train → generate → evaluate (statistical similarity ×15, privacy, detection, hallucination, TSTR) + a rich console report |
 | Recursive loop | `flows/recursive_sdg_flow.py` | runs the SDG pipeline for *N* generations, each trained on the previous generation's synthetic output |
 
-The repo was built one stage at a time, each stage verified against the
-production data lake before the next was started; the git history has the
-per-stage detail.
+The repo was built one stage at a time; the git history has the per-stage
+detail.
 
 ## Setup
 
@@ -107,10 +106,6 @@ Step7/dseed1597_rev_pf_all/
 The command is idempotent per dseed/revision — it skips (with a `[SKIP]`
 message) if the target folder already exists, rather than overwriting.
 
-**Reproducibility.** Verified against `sdpype`'s production seeds: for
-dseed 1597 (both revisions) all ten output files are byte-identical to the
-originals — deterministic RDT/scipy transforms with a fixed split seed.
-
 ### TRTR baseline (`flows/lgbm_cv_flow.py`)
 
 TRTR ("Train Real, Test Real") is the real-data reference point a later
@@ -140,10 +135,6 @@ landing on different hyperparameters.
 `--n-trials 50` can take up to ~1 hour depending on hardware — Optuna trials
 run sequentially, each doing its own 5-fold CV with early-stopped LightGBM
 fits.
-
-**Reproducibility.** Verified against `sdpype`'s production runs for dseed
-1597 (both revisions): every metric, the Optuna CV score, and all best
-hyperparameters reproduce as an exact match to full float precision.
 
 ### SDG pipeline (`flows/sdg_flow.py`)
 
@@ -272,33 +263,7 @@ The one structural departure from `sd-lake` is `<base_name>` itself:
 `experiment_name` template
 (`synthcity_<model>_<3 data hashes>_gen_<N>_<tag>_<config hash>_<mseed>`) in
 production, dropped along with Hydra. File *contents* still match
-byte-for-byte.
-
-#### Reproducibility
-
-Verified against `sdpype`'s production runs (dseed 1597 and 196418,
-`pf_all`, model seed 28657). The encode stage is byte-exact (same
-deterministic transforms as data prep). **`arf`, `rtvae`, and `ctgan` all
-reproduce their generated synthetic data byte-for-byte** too — only `ddpm`'s
-diffusion training shows the stochastic drift you'd expect from a neural
-generator (same shapes/columns/dtypes, distributions in the same range, not
-identical values). `nflow` has no production run to compare against — it is
-smoke-tested only.
-
-The **evaluation stages** were verified the same way: fed each production
-model's real gen-0 encoded/decoded data, every metric block reproduces the
-data lake's stored JSON bit-for-bit (modulo wall-clock timing fields and the
-`base_name` envelope). Two deliberate exceptions:
-
-- `maximum_mean_discrepancy` — the in-pipeline synthcity metric hardcodes
-  `gamma = 1.0` on unit-scaled data and collapses to a `2/n` floor
-  (`≈ 0.0002` for every generator). This port computes the **corrected** MMD
-  (z-score on the real reference, a frozen per-variant RBF gamma, unbiased
-  estimator), matching the paper's post-hoc recomputation rather than the
-  degenerate stored value.
-- `alpha_precision`'s `*_OC` fields depend on an unseeded one-class network
-  fit in synthcity 0.2.12 and are not bit-reproducible across processes; the
-  `*_naive` variant and `prdc_score` are exact.
+byte-for-byte (see **Reproducibility**).
 
 ### Recursive loop (`flows/recursive_sdg_flow.py`)
 
@@ -355,25 +320,38 @@ run omits them, as `sdpype`'s does).
 scope — this port matches `sdpype`'s `experiments/` flow output, not
 `sd-lake`'s promoted/filtered layout.
 
-#### Reproducibility
+## Reproducibility
 
-An 8-generation `arf` chain off dseed 1597 `pf_all` (model seed 28657) was
-compared generation by generation against the data lake's stored
-`Step7pfa_dseed1597_synthcity_arf_mseed28657` chain. **Every generation's
-decoded synthetic CSV is byte-identical**, and every generation's
-`statistical_similarity` / `privacy` / `detection` / `hallucination` /
-`tstr` metric block reproduces the stored JSON (modulo the timing /
-`base_name` envelope and the two `maximum_mean_discrepancy` /
-`alpha_precision *_OC` exceptions above). ARF's tree-based training is fully
-deterministic, so drift never enters the chain; `ddpm` (and any neural
-generator) diverges after generation 0, as it does in the original.
+This is a faithful port: it computes the same values the original `sdpype`
+pipeline does, verified stage by stage against its stored production runs
+(the git history has the per-stage detail).
 
-The metric *trajectory* matches the documented finding that recursive `arf`
-synthesis **uniformises** the data — it drifts away from the real reference
-rather than collapsing to a mode: corrected MMD rises monotonically (~22×
-over 8 generations, bit-exact against `sdpype`'s
-`metrics_long_pfa_mmd_corrected.csv`), `ks_complement` / `tv_complement`
-fall, `wasserstein_distance` rises, TSTR AUROC decays sharply then plateaus,
-and the encoded data's effective rank + mean column entropy climb with
-decelerating increments — approaching the saturation around generation 7–9
-that leads the training-time cliff.
+- **The deterministic path reproduces exactly.** Data prep, the TRTR
+  LightGBM baseline, and every `arf` stage are byte-for-byte identical to
+  the production runs — including a cold 20-generation `arf` recursive chain
+  rebuilt from the population file, where every generation's decoded
+  synthetic CSV and every metric block matches the stored
+  `Step7pfa_dseed1597_synthcity_arf_mseed28657` chain. `rtvae` and `ctgan`
+  also reproduce their synthetic output exactly; `nflow` has no production
+  run to compare against (smoke-tested only).
+- **Stochastic generators match in distribution and trajectory, not
+  bit-for-bit.** `ddpm` diverges from the stored output after generation 0.
+  This is the original's own behaviour, not the port's — a fresh `sdpype`
+  DDPM run diverges from `sdpype`'s stored output by the same margin
+  (~0.05 σ on gen-0 column means). synthcity's DDPM training is not fully
+  deterministic on GPU even with fixed seeds; the other generators are.
+
+Two metric fields deliberately differ from the stored JSON:
+
+- `maximum_mean_discrepancy` — the in-pipeline synthcity metric hardcodes
+  `gamma = 1.0` on unit-scaled data and collapses to a `2/n` floor
+  (`≈ 0.0002` for every generator). This port computes the **corrected** MMD
+  (z-score on the real reference, a frozen per-variant RBF gamma, unbiased
+  estimator), matching the paper's post-hoc recomputation.
+- `alpha_precision`'s `*_OC` fields depend on an unseeded one-class network
+  in synthcity 0.2.12 and are not bit-reproducible across processes; the
+  `*_naive` variant and `prdc_score` are exact.
+
+Run-directory layout follows `sdpype`'s `experiments/` flow output, not the
+promoted `sd-lake` layout, so a `diff -r` against the data lake shows
+folder-shape and `<base_name>` differences — the metric *contents* match.
