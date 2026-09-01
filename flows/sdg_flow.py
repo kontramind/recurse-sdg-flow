@@ -1826,10 +1826,24 @@ def sdg_pipeline(
     statistical_metrics: Optional[list] = None,
     experiment_tag: Optional[str] = None,
     run_name: Optional[str] = None,
+    base_name: Optional[str] = None,
+    tstr_dseed_dir: Optional[str] = None,
     report: bool = True,
     encoder_dir: str = "outputs/sdg_runs/encoders",
     output_dir: str = "outputs/sdg_runs",
 ) -> dict:
+    # base_name is the per-run filename infix every stage's artifact carries
+    # (encoding_<base_name>.json, sdg_model_<base_name>.pkl, statistical_
+    # similarity_<base_name>.json, ...). Defaults to the training-stem-derived
+    # name below; the recursive flow passes it explicitly so each generation's
+    # files land in one flat run dir with a gen_<k> token (mirroring sd-lake,
+    # where every generation's artifacts share one chain folder distinguished
+    # only by gen_<k> in the name).
+    #
+    # tstr_dseed_dir pins TSTR's lookup of lgbm_cv_*.json + the one *test*.csv.
+    # Normally that is just the training file's parent, but a recursive chain
+    # feeds gen k>0 a synthetic CSV whose parent has neither — so the recursive
+    # flow passes the original gen-0 dseed folder here for every generation.
     # Production configs set reference_file == training_file (confirmed in
     # params_step7_pf_pilgram.yaml) — defaulting here matches real behavior,
     # not a shortcut.
@@ -1917,7 +1931,8 @@ def sdg_pipeline(
         encoder_dir=encoder_dir,
     )
 
-    base_name = f"{model_type}_{Path(training_file).stem}_{seed}"
+    if base_name is None:
+        base_name = f"{model_type}_{Path(training_file).stem}_{seed}"
     encode_out = encode_data(
         training_file=training_file,
         metadata_file=metadata_file,
@@ -1979,11 +1994,12 @@ def sdg_pipeline(
         force=force_generate,
     )
 
-    # TSTR needs the dseed folder (lgbm_cv_*.json + the one *test*.csv). Today
-    # that is simply the training file's parent; a future recursive flow must
-    # keep this pinned to the *original* dseed folder, not gen-N's synthetic.
+    # TSTR needs the dseed folder (lgbm_cv_*.json + the one *test*.csv). By
+    # default that is the training file's parent; the recursive flow passes
+    # tstr_dseed_dir to keep it pinned to the *original* gen-0 dseed folder,
+    # not gen-N's synthetic CSV parent.
     tstr_out = tstr_evaluation(
-        dseed_dir=str(Path(training_file).parent),
+        dseed_dir=tstr_dseed_dir or str(Path(training_file).parent),
         synth_decoded_path=generate_out["decoded_path"],
         base_name=base_name,
         output_dir=output_dir,
