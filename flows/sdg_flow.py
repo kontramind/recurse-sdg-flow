@@ -2168,49 +2168,70 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    args = _parse_args()
-    config = _load_config(args.config)
+# Keys resolve_pipeline_settings() accepts as caller overrides. Each maps to
+# a sdg_pipeline() kwarg; a value of None (or an absent key) falls through to
+# the --config value, then the built-in default. flows/recursive_sdg_flow.py
+# feeds this the same dict shape so the config-key mapping lives in one place.
+_CLI_OVERRIDE_KEYS = (
+    "training_file", "population_file", "metadata_file", "encoding_config_file",
+    "model_type", "library", "seed", "params", "reference_file", "n_samples",
+    "post_process_method", "knn_neighbors", "distance_metric", "fallback",
+    "force_generate", "hallucination_num_bins", "privacy_qi_columns",
+    "run_name", "base_name", "tstr_dseed_dir", "report",
+    "encoder_dir", "output_dir",
+)
 
-    # Nested config paths mirror sdpype's params_step7_*.yaml exactly; every
-    # CLI flag still overrides the matching key.
-    training_file = _pick(args.training_file, config, "data.training_file")
-    population_file = _pick(args.population_file, config, "data.population_file")
-    metadata_file = _pick(args.metadata_file, config, "data.metadata_file")
-    encoding_config_file = _pick(args.encoding_config, config, "encoding.config_file")
-    model_type = _pick(args.model_type, config, "sdg.model_type")
-    library = _pick(args.library, config, "sdg.library", _DEFAULTS["library"])
-    seed = _pick(args.seed, config, "experiment.seed", _DEFAULTS["seed"])
-    reference_file = _pick(args.reference_file, config, "data.reference_file")
-    n_samples = _pick(args.n_samples, config, "generation.n_samples")
+
+def resolve_pipeline_settings(config: dict, cli: Optional[dict] = None) -> dict:
+    """Map a loaded --config dict (+ optional caller overrides) to the full
+    kwarg set for sdg_pipeline().
+
+    Nested config paths mirror sdpype's params_step7_*.yaml exactly. `cli` is
+    a plain dict keyed by _CLI_OVERRIDE_KEYS; any value that is None (or a key
+    that is absent) falls through to the config, then the built-in default.
+    Shared by this module's __main__ and by flows/recursive_sdg_flow.py.
+    """
+    cli = cli or {}
+
+    def _o(key):
+        return cli.get(key)
+
+    training_file = _pick(_o("training_file"), config, "data.training_file")
+    population_file = _pick(_o("population_file"), config, "data.population_file")
+    metadata_file = _pick(_o("metadata_file"), config, "data.metadata_file")
+    encoding_config_file = _pick(_o("encoding_config_file"), config, "encoding.config_file")
+    model_type = _pick(_o("model_type"), config, "sdg.model_type")
+    library = _pick(_o("library"), config, "sdg.library", _DEFAULTS["library"])
+    seed = _pick(_o("seed"), config, "experiment.seed", _DEFAULTS["seed"])
+    reference_file = _pick(_o("reference_file"), config, "data.reference_file")
+    n_samples = _pick(_o("n_samples"), config, "generation.n_samples")
 
     _pp = "post_processing.fix_invalid_categories."
-    post_process_method = _pick(args.post_process_method, config, _pp + "method", _DEFAULTS["post_process_method"])
+    post_process_method = _pick(_o("post_process_method"), config, _pp + "method", _DEFAULTS["post_process_method"])
     # `enabled: false` in the config is shorthand for method "none" (only when
-    # --post-process-method wasn't given on the CLI).
-    if args.post_process_method is None and _cfg_get(config, _pp + "enabled", True) is False:
+    # the caller didn't pass post_process_method).
+    if _o("post_process_method") is None and _cfg_get(config, _pp + "enabled", True) is False:
         post_process_method = "none"
-    knn_neighbors = _pick(args.knn_neighbors, config, _pp + "knn_neighbors", _DEFAULTS["knn_neighbors"])
-    distance_metric = _pick(args.distance_metric, config, _pp + "distance_metric", _DEFAULTS["distance_metric"])
-    fallback = _pick(args.fallback, config, _pp + "fallback", _DEFAULTS["fallback"])
+    knn_neighbors = _pick(_o("knn_neighbors"), config, _pp + "knn_neighbors", _DEFAULTS["knn_neighbors"])
+    distance_metric = _pick(_o("distance_metric"), config, _pp + "distance_metric", _DEFAULTS["distance_metric"])
+    fallback = _pick(_o("fallback"), config, _pp + "fallback", _DEFAULTS["fallback"])
 
-    force_generate = _pick(args.force_generate, config, "force_generate", _DEFAULTS["force_generate"])
-    encoder_dir = _pick(args.encoder_dir, config, "encoder_dir", _DEFAULTS["encoder_dir"])
-    output_dir = _pick(args.output_dir, config, "output_dir", _DEFAULTS["output_dir"])
+    force_generate = _pick(_o("force_generate"), config, "force_generate", _DEFAULTS["force_generate"])
+    encoder_dir = _pick(_o("encoder_dir"), config, "encoder_dir", _DEFAULTS["encoder_dir"])
+    output_dir = _pick(_o("output_dir"), config, "output_dir", _DEFAULTS["output_dir"])
     # experiment.tag (Step7pfa / Step7pfp) drives the sd-lake-style run-dir
-    # wrapper; --run-name overrides the assembled name outright.
+    # wrapper; run_name overrides the assembled name outright.
     experiment_tag = _cfg_get(config, "experiment.tag", None)
-    run_name = args.run_name
 
-    if args.hallucination_num_bins is not None:
-        hallucination_num_bins = args.hallucination_num_bins
+    if _o("hallucination_num_bins") is not None:
+        hallucination_num_bins = _o("hallucination_num_bins")
     else:
         hallucination_num_bins = _cfg_get(
             config, "evaluation.hallucination.num_bins", _DEFAULTS["hallucination_num_bins"]
         )
 
-    if args.privacy_qi_columns is not None:
-        privacy_qi_columns = [c.strip() for c in args.privacy_qi_columns.split(",") if c.strip()]
+    if _o("privacy_qi_columns") is not None:
+        privacy_qi_columns = _o("privacy_qi_columns")
     else:
         _priv_metrics = _cfg_get(config, "evaluation.privacy.metrics", None) or []
         privacy_qi_columns = (
@@ -2227,35 +2248,16 @@ if __name__ == "__main__":
     # back to its built-in list (the full Step7 set of 15 sub-metrics).
     statistical_metrics = _cfg_get(config, "evaluation.statistical_similarity.metrics", None)
 
-    # --params is a JSON string on the CLI; sdg.parameters in the config is
-    # already a native mapping (YAML parses nested dicts directly).
-    if args.params is not None:
-        parameters = json.loads(args.params)
+    # params may arrive as a JSON string (CLI) or a native mapping (config /
+    # a caller passing sdg.parameters straight through).
+    _params = _o("params")
+    if _params is not None:
+        parameters = json.loads(_params) if isinstance(_params, str) else _params
     else:
         _p = _cfg_get(config, "sdg.parameters", None)
         parameters = _DEFAULTS["params"] if _p is None else _p
 
-    missing = [
-        name for name, value in [
-            ("--training-file", training_file),
-            ("--population-file", population_file),
-            ("--metadata-file", metadata_file),
-            ("--encoding-config", encoding_config_file),
-            ("--model-type", model_type),
-        ] if value is None
-    ]
-    if missing:
-        raise SystemExit(
-            f"Missing required setting(s) (pass via CLI flag or --config): {', '.join(missing)}"
-        )
-    if model_type not in VALID_MODEL_TYPES:
-        raise SystemExit(f"Invalid model_type {model_type!r} (choices: {sorted(VALID_MODEL_TYPES)})")
-    if post_process_method not in VALID_POST_PROCESS_METHODS:
-        raise SystemExit(f"Invalid post_process_method {post_process_method!r} (choices: {sorted(VALID_POST_PROCESS_METHODS)})")
-    if fallback not in VALID_FALLBACKS:
-        raise SystemExit(f"Invalid fallback {fallback!r} (choices: {sorted(VALID_FALLBACKS)})")
-
-    sdg_pipeline(
+    return dict(
         training_file=training_file,
         population_file=population_file,
         metadata_file=metadata_file,
@@ -2277,8 +2279,69 @@ if __name__ == "__main__":
         detection_common_params=detection_common_params,
         statistical_metrics=statistical_metrics,
         experiment_tag=experiment_tag,
-        run_name=run_name,
-        report=not args.no_report,
+        run_name=_o("run_name"),
+        base_name=_o("base_name"),
+        tstr_dseed_dir=_o("tstr_dseed_dir"),
+        report=cli.get("report", True),
         encoder_dir=encoder_dir,
         output_dir=output_dir,
     )
+
+
+def validate_pipeline_settings(settings: dict) -> None:
+    """Raise SystemExit with a clear message on missing/invalid settings."""
+    missing = [
+        flag for flag, key in [
+            ("--training-file", "training_file"),
+            ("--population-file", "population_file"),
+            ("--metadata-file", "metadata_file"),
+            ("--encoding-config", "encoding_config_file"),
+            ("--model-type", "model_type"),
+        ] if settings.get(key) is None
+    ]
+    if missing:
+        raise SystemExit(
+            f"Missing required setting(s) (pass via CLI flag or --config): {', '.join(missing)}"
+        )
+    if settings["model_type"] not in VALID_MODEL_TYPES:
+        raise SystemExit(f"Invalid model_type {settings['model_type']!r} (choices: {sorted(VALID_MODEL_TYPES)})")
+    if settings["post_process_method"] not in VALID_POST_PROCESS_METHODS:
+        raise SystemExit(f"Invalid post_process_method {settings['post_process_method']!r} (choices: {sorted(VALID_POST_PROCESS_METHODS)})")
+    if settings["fallback"] not in VALID_FALLBACKS:
+        raise SystemExit(f"Invalid fallback {settings['fallback']!r} (choices: {sorted(VALID_FALLBACKS)})")
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    config = _load_config(args.config)
+
+    cli = {
+        "training_file": args.training_file,
+        "population_file": args.population_file,
+        "metadata_file": args.metadata_file,
+        "encoding_config_file": args.encoding_config,
+        "model_type": args.model_type,
+        "library": args.library,
+        "seed": args.seed,
+        "params": args.params,
+        "reference_file": args.reference_file,
+        "n_samples": args.n_samples,
+        "post_process_method": args.post_process_method,
+        "knn_neighbors": args.knn_neighbors,
+        "distance_metric": args.distance_metric,
+        "fallback": args.fallback,
+        "force_generate": args.force_generate,
+        "hallucination_num_bins": args.hallucination_num_bins,
+        "privacy_qi_columns": (
+            [c.strip() for c in args.privacy_qi_columns.split(",") if c.strip()]
+            if args.privacy_qi_columns is not None else None
+        ),
+        "run_name": args.run_name,
+        "report": not args.no_report,
+        "encoder_dir": args.encoder_dir,
+        "output_dir": args.output_dir,
+    }
+
+    settings = resolve_pipeline_settings(config, cli)
+    validate_pipeline_settings(settings)
+    sdg_pipeline(**settings)
