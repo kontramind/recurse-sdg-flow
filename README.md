@@ -187,12 +187,8 @@ uv run python3 flows/sdg_flow.py \
 | `rtvae` | Robust-divergence VAE |
 | `nflow` | Normalizing flow |
 
-All via synthcity's `Plugins()`. Only `library=synthcity` is implemented
-(`--library` defaults to it) — the original also supported SDV- and
-synthpop-backed generators, but neither was ever used to produce a reported
-result (confirmed by checking every experiment folder in the production data
-lake), so they are out of scope. `--library` is kept as a real argument, not
-hardcoded, so adding a backend later is a contained change.
+All five are synthcity generators, loaded via synthcity's `Plugins()`.
+`--library` defaults to `synthcity`, the only backend implemented.
 
 Hyperparameters go in as an inline JSON string via `--params` (default
 `'{}'` — all model defaults), e.g. `--params '{"n_iter": 500}'` for a faster
