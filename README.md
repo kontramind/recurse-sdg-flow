@@ -16,7 +16,10 @@ TBD]. It is being assembled incrementally:
    hallucination, TSTR — plus an end-of-run rich console report + timing
    summary. Every metric verified against the production data lake's gen-0
    artifacts (see *Reproducibility* below).
-6. ⏳ Recursive multi-generation loop
+6. ✅ Recursive multi-generation loop (`flows/recursive_sdg_flow.py`) — runs
+   `sdg_flow.py` N times, each generation trained on the previous one's
+   synthetic output. Verified against the production data lake generation by
+   generation (see *Recursive loop* below).
 
 ## Setup
 
@@ -257,3 +260,79 @@ wall-clock timing fields). Two deliberate exceptions:
 - `alpha_precision`'s `*_OC` fields depend on an unseeded one-class network
   fit in synthcity 0.2.12, so they are not bit-reproducible across
   processes; the `*_naive` variant and `prdc_score` are exact.
+
+### Recursive loop (`flows/recursive_sdg_flow.py`)
+
+Runs `sdg_flow.py` for `N` generations. Generation 0 trains on the config's
+training file; generation *k* trains on generation *k−1*'s **decoded
+synthetic** output. The population, reference, metadata and encoding config
+stay fixed from generation 0 for the whole chain.
+
+```bash
+# One 20-generation chain (dataset + eval config come from --config)
+uv run python3 flows/recursive_sdg_flow.py --config configs/step7_pf_all.yaml --n-generations 20
+
+# Suppress the per-generation rich report / force regeneration
+uv run python3 flows/recursive_sdg_flow.py --config configs/step7_pf_all.yaml --n-generations 20 --no-report
+uv run python3 flows/recursive_sdg_flow.py --config configs/step7_pf_all.yaml --n-generations 20 --force-generate
+```
+
+**Sweeps.** Repeat `--model-type` and/or `--mseed` for a sequential
+Cartesian sweep — each combination runs its own full `N`-generation chain.
+This is the grid the paper's Step7 runs used:
+
+```bash
+uv run python3 flows/recursive_sdg_flow.py \
+  --config configs/step7_pf_all.yaml \
+  --model-type arf --model-type ddpm --model-type ctgan --model-type rtvae \
+  --mseed 987 --mseed 28657 --mseed 5702887 --mseed 24157817 --mseed 39088169 \
+  --n-generations 20
+# 4 models × 5 seeds = 20 chains, one after another
+```
+
+For more than one dataset, loop over configs in the shell (`configs/` is how
+this port selects a dataset — `sdpype`'s original `--dseed-dir` sweep
+dimension collapses to this):
+
+```bash
+for cfg in configs/step7_pf_all.yaml configs/step7_pf_pilgram.yaml; do
+  uv run python3 flows/recursive_sdg_flow.py --config "$cfg" \
+    --model-type arf --model-type ddpm --mseed 987 --mseed 28657 --n-generations 20
+done
+```
+
+**Layout.** All generations of one chain share a single flat run directory
+(`outputs/recursive_runs/<tag>_<dseed>_<library>_<model>_mseed<seed>/`),
+told apart only by a `gen_<k>` token in every `<base_name>` — the same shape
+`sd-lake` uses. Re-running the same command resumes: any generation whose
+artifacts already exist is skipped (per-stage cache guards); `--force-generate`
+overrides. Each generation's `hallucination_<base_name>.json` additionally
+gets the `unified_metrics` / `complexity_metrics` blocks that `sd-lake`
+carries (row-count proxies, injected during sd-lake promotion in the
+original; a standalone `sdg_flow.py` run omits them, as `sdpype`'s does).
+
+`sdpype`'s `publish_to_sdlake` / `trace_chain` promotion machinery is out of
+scope — this port matches `sdpype`'s `experiments/` flow output, not
+`sd-lake`'s promoted/filtered layout.
+
+**Reproducibility.** An 8-generation `arf` chain off `dseed 1597` `pf_all`
+(model seed 28657) was compared generation by generation against the
+production data lake's stored `Step7pfa_dseed1597_synthcity_arf_mseed28657`
+chain. Every generation's decoded synthetic CSV is **byte-identical**, and
+every generation's `statistical_similarity` / `privacy` / `detection` /
+`hallucination` / `tstr` metric block reproduces the stored JSON (modulo the
+same timing / `base_name` envelope noted above, and the two
+`maximum_mean_discrepancy` / `alpha_precision *_OC` exceptions). ARF's
+tree-based training is fully deterministic, so drift never enters the chain;
+`ddpm` (and any neural generator) will diverge after generation 0, as it
+does in the original.
+
+The metric *trajectory* also matches the documented finding that recursive
+`arf` synthesis **uniformises** the data — it drifts away from the real
+reference rather than collapsing toward a mode: corrected MMD rises
+monotonically (~22× over 8 generations, bit-exact against `sdpype`'s
+`metrics_long_pfa_mmd_corrected.csv`), `ks_complement` / `tv_complement`
+fall, `wasserstein_distance` rises, TSTR AUROC decays sharply then plateaus,
+and the encoded data's effective rank + mean column entropy climb with
+decelerating increments — approaching the saturation around generation 7–9
+that leads the training-time cliff.
